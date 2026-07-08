@@ -48,6 +48,20 @@ on:
         required: false
         type: string
         default: ''
+      cache_models:
+        description: Cache the MAX venv + model weights/compile artifacts (local MAX only)
+        required: false
+        type: boolean
+        default: true
+      llm_extra_body:
+        description: >-
+          Optional JSON merged into every LLM request (OCR llm.extra_body).
+          Use for thinking-capable models, e.g.
+          '{"chat_template_kwargs": {"enable_thinking": false}}'.
+          Leave empty for models without a thinking mode (default Qwen2.5).
+        required: false
+        type: string
+        default: ''
     secrets:
       HF_TOKEN:
         description: Hugging Face hub token for gated models and Hub downloads
@@ -68,7 +82,7 @@ jobs:
       - name: Get PR context
         id: pr-context
         if: github.event_name != 'pull_request_target'
-        uses: actions/github-script@v7.0.1
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             const prNumber = context.issue.number;
@@ -83,7 +97,7 @@ jobs:
             core.setOutput('pr_number', String(prNumber));
 
       - name: Checkout repository
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || steps.pr-context.outputs.head_sha }}
@@ -94,7 +108,7 @@ jobs:
           git fetch origin "pull/${PR_NUMBER}/head"
 
       - name: Checkout action scripts
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.0
         with:
           repository: martinvuyk/modular-open-code-review
           ref: ${{ inputs.action_ref }}
@@ -107,7 +121,7 @@ jobs:
 
       - name: Restore codebase index cache
         id: cbm-cache
-        uses: actions/cache/restore@v4.2.2
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ runner.tool_cache }}/cbm-index
           key: cbm-index-${{ github.event.pull_request.base.ref || steps.pr-context.outputs.base_ref }}-${{ github.event.pull_request.base.sha }}
@@ -132,6 +146,7 @@ jobs:
         env:
           MODEL_OVERRIDE: ${{ inputs.model_override }}
           MAX_ESTIMATED_TOKENS: ${{ inputs.max_estimated_tokens }}
+          EXTERNAL_LLM: ${{ inputs.llm_url != '' }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
@@ -171,10 +186,12 @@ jobs:
           echo "max_quant=${MAX_QUANT}" >> "$GITHUB_OUTPUT"
           echo "ocr_concurrency=${OCR_CONCURRENCY}" >> "$GITHUB_OUTPUT"
           echo "estimated_tokens=${ESTIMATED_TOKENS}" >> "$GITHUB_OUTPUT"
+          echo "free_ram_gb=${FREE_RAM_GB}" >> "$GITHUB_OUTPUT"
+          echo "required_ram_gb=${REQUIRED_RAM_GB}" >> "$GITHUB_OUTPUT"
 
       - name: Skip review — diff too large
         if: steps.preflight.outputs.skip_review == 'true'
-        uses: actions/github-script@v7.0.1
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             const reason = `${{ steps.preflight.outputs.skip_reason }}` || 'estimated token budget exceeded';
@@ -195,11 +212,13 @@ jobs:
           python_version: '3.12'
           model: ${{ steps.preflight.outputs.max_model }}
           quantization: ${{ steps.preflight.outputs.max_quant }}
+          cache: ${{ inputs.cache_models }}
 
       - name: Configure OCR for review
         if: steps.preflight.outputs.skip_review != 'true'
         env:
           CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
+          LLM_EXTRA_BODY: ${{ inputs.llm_extra_body }}
         run: |
           set -euo pipefail
           LLM_URL="${{ inputs.llm_url }}"
@@ -210,7 +229,12 @@ jobs:
           ocr config set llm.auth_token "local-max"
           ocr config set llm.model "${{ steps.preflight.outputs.max_model }}"
           ocr config set llm.use_anthropic false
-          ocr config set llm.extra_body '{"thinking": {"type": "disabled"}}'
+          # Only set extra_body when provided; models without a thinking mode
+          # (default Qwen2.5) must not receive a `thinking`/`chat_template_kwargs`
+          # field. MAX also serves with --allow-extra-request-fields as a backstop.
+          if [ -n "$LLM_EXTRA_BODY" ]; then
+            ocr config set llm.extra_body "$LLM_EXTRA_BODY"
+          fi
           ocr config set mcp_servers.codebase-memory.command codebase-memory-mcp
           ocr config set mcp_servers.codebase-memory.setup 'codebase-memory-mcp cli list_projects'
           ocr config set mcp_servers.codebase-memory.env "[\"CBM_CACHE_DIR=${CBM_CACHE_DIR}\",\"CBM_LOG_LEVEL=info\"]"
@@ -218,6 +242,12 @@ jobs:
       - name: Run Open Code Review
         id: review
         if: steps.preflight.outputs.skip_review != 'true'
+        env:
+          # OCR runs the MCP server's setup command (`cli list_projects`) as a
+          # child process. It applies mcp_servers.*.env to the server, not the
+          # setup command, so export CBM_CACHE_DIR here too — otherwise setup
+          # falls back to ~/.cache/codebase-memory-mcp and can't find the index.
+          CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
@@ -228,23 +258,39 @@ jobs:
             HEAD_SHA="${{ steps.pr-context.outputs.head_sha }}"
           fi
 
+          # ocr review exits 0 on success (with or without findings) and
+          # non-zero only on operational failure. Capture the code instead of
+          # discarding it so a genuine failure fails the job (see "Fail on
+          # review error" below). We still let later steps run first so any
+          # error comment is posted to the PR.
+          set +e
           ocr review \
             --from "$BASE_REF" \
             --to "$HEAD_SHA" \
             --format json \
             --concurrency "${{ steps.preflight.outputs.ocr_concurrency }}" \
-            > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log || true
+            > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log
+          rc=$?
+          set -e
 
           echo "OCR stderr:"
           cat /tmp/ocr-stderr.log || true
+          echo "ocr_exit_code=${rc}" >> "$GITHUB_OUTPUT"
 
-          if [ -f /tmp/ocr-result.json ]; then
-            total=$(jq -r '.total_tokens // .usage.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            prompt=$(jq -r '.prompt_tokens // .usage.prompt_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            completion=$(jq -r '.completion_tokens // .usage.completion_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+          # OCR emits token counts under .summary (json:"total_tokens" etc.).
+          if [ -s /tmp/ocr-result.json ]; then
+            total=$(jq -r '.summary.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            input=$(jq -r '.summary.input_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            output=$(jq -r '.summary.output_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            files=$(jq -r '.summary.files_reviewed // empty' /tmp/ocr-result.json 2>/dev/null || true)
             echo "actual_total_tokens=${total:-}" >> "$GITHUB_OUTPUT"
-            echo "actual_prompt_tokens=${prompt:-}" >> "$GITHUB_OUTPUT"
-            echo "actual_completion_tokens=${completion:-}" >> "$GITHUB_OUTPUT"
+            echo "actual_input_tokens=${input:-}" >> "$GITHUB_OUTPUT"
+            echo "actual_output_tokens=${output:-}" >> "$GITHUB_OUTPUT"
+            echo "files_reviewed=${files:-}" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Open Code Review failed (exit ${rc}) — see stderr above."
           fi
 
       - name: Post review comments
@@ -254,6 +300,12 @@ jobs:
           ocr_result_path: /tmp/ocr-result.json
           ocr_stderr_path: /tmp/ocr-stderr.log
 
+      - name: Fail on review error
+        if: steps.review.outputs.ocr_exit_code != '' && steps.review.outputs.ocr_exit_code != '0'
+        run: |
+          echo "::error::Failing job: Open Code Review exited ${{ steps.review.outputs.ocr_exit_code }}."
+          exit 1
+
       - name: Job summary
         if: always()
         run: |
@@ -261,11 +313,14 @@ jobs:
             echo "## Open Code Review"
             echo "- Estimated tokens: ${{ steps.preflight.outputs.estimated_tokens }}"
             if [ -n "${{ steps.review.outputs.actual_total_tokens }}" ]; then
-              echo "- Actual tokens: ${{ steps.review.outputs.actual_total_tokens }} (prompt: ${{ steps.review.outputs.actual_prompt_tokens }}, completion: ${{ steps.review.outputs.actual_completion_tokens }})"
+              echo "- Actual tokens: ${{ steps.review.outputs.actual_total_tokens }} (input: ${{ steps.review.outputs.actual_input_tokens }}, output: ${{ steps.review.outputs.actual_output_tokens }})"
+              echo "- Files reviewed: ${{ steps.review.outputs.files_reviewed || 'n/a' }}"
             else
               echo "- Actual tokens: n/a (review skipped or failed)"
             fi
-            echo "- Model: ${{ steps.preflight.outputs.max_model }}"
+            echo "- Model: ${{ steps.preflight.outputs.max_model }} (${{ steps.preflight.outputs.max_quant }})"
+            echo "- Estimated RAM: ~${{ steps.preflight.outputs.required_ram_gb }} GB needed / ${{ steps.preflight.outputs.free_ram_gb }} GB free"
             echo "- Concurrency: ${{ steps.preflight.outputs.ocr_concurrency }}"
             echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
+            echo "- Review exit code: ${{ steps.review.outputs.ocr_exit_code || 'n/a' }}"
           } >> "$GITHUB_STEP_SUMMARY"

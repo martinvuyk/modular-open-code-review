@@ -13,54 +13,127 @@ inputs:
     description: Hugging Face model ID for max serve
     required: true
   quantization:
-    description: Quantization encoding for GGUF models
+    description: Weight encoding (float32 for CPU safetensors, q4_k etc. for GGUF)
     required: false
-    default: 'q4_k'
+    default: 'float32'
   port:
     description: Local port for max serve
     required: false
     default: '8000'
+  serve_timeout:
+    description: Seconds to wait for max serve health endpoint (cold start can be slow)
+    required: false
+    default: '1800'
+  cache:
+    description: Cache the venv and model weights/compile artifacts across runs
+    required: false
+    default: 'true'
 runs:
   using: composite
   steps:
     - name: Setup Python
-      uses: actions/setup-python@v5.4.0
+      uses: actions/setup-python@v6.3.0
       with:
         python-version: ${{ inputs.python_version }}
+
+    - name: Resolve Python version
+      id: pyver
+      shell: bash
+      run: echo "version=$(python -c 'import platform; print(platform.python_version())')" >> "$GITHUB_OUTPUT"
+
+    # Cache the whole venv keyed on the exact Python patch + MAX version, so a
+    # cache hit skips pip install entirely. A Python patch bump busts the key
+    # (venv symlinks would otherwise break).
+    - name: Cache MAX virtualenv
+      id: venv-cache
+      if: inputs.cache == 'true'
+      uses: actions/cache@v6.1.0
+      with:
+        path: ~/.venv-max
+        key: venv-max-${{ runner.os }}-py${{ steps.pyver.outputs.version }}-${{ inputs.modular_version }}
+
     - name: Install Modular MAX
       shell: bash
       run: |
         set -euo pipefail
-        python -m pip install --upgrade pip
-        pip install "modular==${{ inputs.modular_version }}"
-        max --version || true
-    - name: Restore Hugging Face model cache
-      uses: actions/cache/restore@v4.2.2
+        VENV="$HOME/.venv-max"
+        if [ ! -x "$VENV/bin/max" ]; then
+          python -m venv "$VENV"
+          "$VENV/bin/python" -m pip install --upgrade pip
+          "$VENV/bin/pip" install "modular==${{ inputs.modular_version }}"
+        fi
+        # Put the venv on PATH for all later steps (warm-cache, serve).
+        echo "$VENV/bin" >> "$GITHUB_PATH"
+        "$VENV/bin/max" --version || true
+
+    - name: Restore model caches
+      id: model-cache
+      if: inputs.cache == 'true'
+      uses: actions/cache/restore@v6.1.0
       with:
-        path: ~/.cache/huggingface
-        key: hf-models-${{ inputs.model }}-${{ inputs.modular_version }}
+        path: |
+          ~/.cache/huggingface
+          ${{ runner.tool_cache }}/modular-max-cache
+        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}-v2
         restore-keys: |
-          hf-models-${{ inputs.model }}-
-    - name: Start max serve
+          max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-
+          max-cpu-models-${{ inputs.modular_version }}-v2
+
+    - name: Warm MAX cache (download + compile)
       shell: bash
       env:
         HF_HOME: ~/.cache/huggingface
         HF_TOKEN: ${{ env.HF_TOKEN }}
+        MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
+      run: |
+        set -euo pipefail
+        mkdir -p "$MODULAR_MAX_CACHE_DIR"
+        mapfile -d '' -t args < <(bash "${{ github.action_path }}/../../scripts/max-model-cli.sh" \
+          "${{ inputs.model }}" "${{ inputs.quantization }}")
+        max warm-cache "${args[@]}"
+
+    - name: Start max serve
+      id: max-serve
+      shell: bash
+      env:
+        HF_HOME: ~/.cache/huggingface
+        HF_TOKEN: ${{ env.HF_TOKEN }}
+        MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
         MAX_MODEL: ${{ inputs.model }}
         MAX_PORT: ${{ inputs.port }}
         MAX_QUANT: ${{ inputs.quantization }}
       run: |
         set -euo pipefail
-        nohup max serve \
-          --devices=cpu \
-          --model "$MAX_MODEL" \
-          --quantization-encoding "$MAX_QUANT" \
-          > /tmp/max-serve.log 2>&1 &
+        mkdir -p "$MODULAR_MAX_CACHE_DIR"
+        : > /tmp/max-serve.log
+        mapfile -d '' -t args < <(bash "${{ github.action_path }}/../../scripts/max-model-cli.sh" \
+          "$MAX_MODEL" "$MAX_QUANT")
+        # --allow-extra-request-fields (MAX >= 26.4): drop unknown top-level
+        # request fields with a warning instead of returning 400, so a stray
+        # client-side param never fails the whole review.
+        nohup max serve "${args[@]}" --allow-extra-request-fields >> /tmp/max-serve.log 2>&1 &
         echo $! > /tmp/max-serve.pid
-        bash "${{ github.action_path }}/../../scripts/wait-for-http.sh" \
-          "http://127.0.0.1:${MAX_PORT}/v1/health" 900
-    - name: Save Hugging Face model cache
-      uses: actions/cache/save@v4.2.2
+        if ! bash "${{ github.action_path }}/../../scripts/wait-for-http.sh" \
+          "http://127.0.0.1:${MAX_PORT}/v1/health" "${{ inputs.serve_timeout }}"; then
+          echo "::error::max serve did not become ready in time"
+          if [[ -f /tmp/max-serve.log ]]; then
+            echo "---- tail /tmp/max-serve.log ----"
+            tail -n 80 /tmp/max-serve.log || true
+          fi
+          if [[ -f /tmp/max-serve.pid ]]; then
+            kill "$(cat /tmp/max-serve.pid)" 2>/dev/null || true
+          fi
+          exit 1
+        fi
+
+    # success() only: a failed serve/compile must not persist a broken cache.
+    # On PR runs the token is read-only, so this save is a no-op there; the
+    # push-triggered warm workflow is what actually populates the shared cache.
+    - name: Save model caches
+      if: success() && inputs.cache == 'true' && steps.model-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6.1.0
       with:
-        path: ~/.cache/huggingface
-        key: hf-models-${{ inputs.model }}-${{ inputs.modular_version }}
+        path: |
+          ~/.cache/huggingface
+          ${{ runner.tool_cache }}/modular-max-cache
+        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}-v2

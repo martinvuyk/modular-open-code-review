@@ -9,24 +9,34 @@
     "small_tokens": 50000,
     "medium_tokens": 200000,
     "max_tokens": 500000,
-    "min_free_ram_gb_for_7b": 14,
     "max_bundles_before_concurrency_cap": 20,
     "max_files_before_concurrency_cap": 50
   },
+  "ram_estimate": {
+    "safety_factor": 1.4,
+    "base_overhead_gb": 2,
+    "dtype_bytes": {
+      "float32": 4,
+      "float16": 2,
+      "bfloat16": 2,
+      "q8_0": 1,
+      "q4_k": 0.5
+    }
+  },
   "models": {
     "small": {
-      "id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
-      "quantization": "q4_k",
+      "id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "quantization": "float32",
       "concurrency": 3
     },
     "medium": {
-      "id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
-      "quantization": "q4_k",
+      "id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "quantization": "float32",
       "concurrency": 4
     },
     "large_load": {
-      "id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
-      "quantization": "q4_k",
+      "id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "quantization": "float32",
       "concurrency": 2
     }
   }
