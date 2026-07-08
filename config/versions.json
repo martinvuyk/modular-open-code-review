@@ -1,0 +1,18 @@
+{
+  "ocr_version": "1.7.4",
+  "ocr_install": "npm",
+  "cbm_version": "0.8.1",
+  "cbm_install": "npm",
+  "modular_version": "26.4.0",
+  "node_version": "24",
+  "python_version": "3.12",
+  "runner": "ubuntu-24.04",
+  "actions": {
+    "checkout": "v4.2.2",
+    "setup_node": "v4.1.0",
+    "setup_python": "v5.4.0",
+    "cache_restore": "v4.2.2",
+    "cache_save": "v4.2.2",
+    "github_script": "v7.0.1"
+  }
+}

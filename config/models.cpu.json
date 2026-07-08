@@ -1,0 +1,33 @@
+{
+  "heuristics": {
+    "bytes_per_token": 4,
+    "prompt_overhead_per_bundle": 8000,
+    "context_overhead_per_file": 1500,
+    "mcp_tool_buffer": 20000
+  },
+  "thresholds": {
+    "small_tokens": 50000,
+    "medium_tokens": 200000,
+    "max_tokens": 500000,
+    "min_free_ram_gb_for_7b": 14,
+    "max_bundles_before_concurrency_cap": 20,
+    "max_files_before_concurrency_cap": 50
+  },
+  "models": {
+    "small": {
+      "id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
+      "quantization": "q4_k",
+      "concurrency": 3
+    },
+    "medium": {
+      "id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+      "quantization": "q4_k",
+      "concurrency": 4
+    },
+    "large_load": {
+      "id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+      "quantization": "q4_k",
+      "concurrency": 2
+    }
+  }
+}

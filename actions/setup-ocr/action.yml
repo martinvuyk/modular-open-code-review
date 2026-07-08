@@ -1,0 +1,24 @@
+name: Setup Open Code Review
+description: Install pinned OCR via npm (@alibaba-group/open-code-review).
+inputs:
+  ocr_version:
+    description: OCR npm version (e.g. 1.7.4)
+    required: false
+    default: '1.7.4'
+  node_version:
+    description: Node.js version for npm
+    required: false
+    default: '24'
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4.1.0
+      with:
+        node-version: ${{ inputs.node_version }}
+    - name: Install OCR
+      shell: bash
+      run: |
+        set -euo pipefail
+        npm install -g "@alibaba-group/open-code-review@${{ inputs.ocr_version }}"
+        ocr version || true

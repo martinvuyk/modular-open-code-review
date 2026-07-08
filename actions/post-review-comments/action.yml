@@ -1,0 +1,14 @@
+name: Post Open Code Review comments
+description: Parse OCR JSON output and post inline PR review comments.
+inputs:
+  ocr_result_path:
+    description: Path to OCR JSON result file
+    required: false
+    default: /tmp/ocr-result.json
+  ocr_stderr_path:
+    description: Path to OCR stderr log
+    required: false
+    default: /tmp/ocr-stderr.log
+runs:
+  using: node20
+  main: post-review.js

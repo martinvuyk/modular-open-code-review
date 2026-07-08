@@ -1,0 +1,14 @@
+{
+  "mcp_servers": {
+    "codebase-memory": {
+      "command": "/usr/local/bin/codebase-memory-mcp",
+      "args": [],
+      "env": [
+        "CBM_CACHE_DIR=${CBM_CACHE_DIR}",
+        "CBM_LOG_LEVEL=info"
+      ],
+      "tools": [],
+      "setup": "codebase-memory-mcp cli list_projects"
+    }
+  }
+}

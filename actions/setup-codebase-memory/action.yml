@@ -1,0 +1,36 @@
+name: Setup codebase-memory-mcp
+description: Install pinned codebase-memory-mcp via npm.
+inputs:
+  cbm_version:
+    description: CBM npm version (e.g. 0.8.1)
+    required: false
+    default: '0.8.1'
+  node_version:
+    description: Node.js version for npm
+    required: false
+    default: '24'
+  cache_path:
+    description: Path where GHA cache restored the index artifacts
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4.1.0
+      with:
+        node-version: ${{ inputs.node_version }}
+    - name: Install CBM
+      shell: bash
+      run: |
+        set -euo pipefail
+        npm install -g "codebase-memory-mcp@${{ inputs.cbm_version }}"
+        codebase-memory-mcp --version || true
+    - name: Restore index into CBM_CACHE_DIR
+      if: inputs.cache_path != ''
+      shell: bash
+      env:
+        CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
+      run: |
+        set -euo pipefail
+        bash "${{ github.action_path }}/../../scripts/restore-cbm-index.sh" "${{ inputs.cache_path }}"

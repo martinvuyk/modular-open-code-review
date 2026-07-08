@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver version without v prefix (e.g. 1.0.0)
+        required: true
+        type: string
+      bump_main:
+        description: Update README/examples consumer refs on main
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            TAG="v${VERSION#v}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}$"; then
+            echo "Tag ${TAG} already exists on origin"
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Create GitHub Release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists"
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag
+            echo "Created release ${TAG}"
+          fi
+
+      - name: Bump consumer refs on main
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.bump_main != false)
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          git fetch origin main
+          git checkout main
+          git pull origin main
+          bash scripts/bump-consumer-refs.sh "$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md examples/ config/release.json
+          if git diff --staged --quiet; then
+            echo "Consumer refs already up to date"
+          else
+            git commit -m "chore: bump consumer refs to ${TAG}"
+            git push origin main
+          fi
+
+      - name: Release summary
+        run: |
+          {
+            echo "## Release ${{ steps.meta.outputs.tag }}"
+            echo "- Consumer ref: \`$(jq -r .consumer_ref config/release.json)\`"
+            echo "- OCR: $(jq -r .ocr_version config/versions.json)"
+            echo "- codebase-memory-mcp: $(jq -r .cbm_version config/versions.json)"
+            echo "- Modular MAX: $(jq -r .modular_version config/versions.json)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,5 @@
+name: Modular Open Code Review
+description: Plug-and-play PR code review with Open Code Review, codebase-memory-mcp, and Modular MAX.
+branding:
+  icon: check-circle
+  color: blue

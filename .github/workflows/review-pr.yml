@@ -1,0 +1,271 @@
+name: Open Code Review PR
+
+on:
+  workflow_call:
+    inputs:
+      ocr_version:
+        description: Open Code Review release version
+        required: false
+        type: string
+        default: '1.7.4'
+      cbm_version:
+        description: codebase-memory-mcp release version
+        required: false
+        type: string
+        default: '0.8.1'
+      modular_version:
+        description: Modular MAX pip version
+        required: false
+        type: string
+        default: '26.4.0'
+      runner:
+        description: GitHub-hosted runner label
+        required: false
+        type: string
+        default: ubuntu-24.04
+      model_override:
+        description: Force a specific Hugging Face model ID
+        required: false
+        type: string
+        default: ''
+      max_estimated_tokens:
+        description: Skip review when estimated tokens exceed this value
+        required: false
+        type: string
+        default: '500000'
+      post_comments:
+        description: Post findings as GitHub PR review comments
+        required: false
+        type: boolean
+        default: true
+      action_ref:
+        description: Git ref of modular-open-code-review for scripts
+        required: false
+        type: string
+        default: main
+      llm_url:
+        description: Optional external OpenAI-compatible LLM URL (skips local MAX)
+        required: false
+        type: string
+        default: ''
+    secrets:
+      HF_TOKEN:
+        description: Hugging Face hub token for gated models and Hub downloads
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ocr-review-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Get PR context
+        id: pr-context
+        if: github.event_name != 'pull_request_target'
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            core.setOutput('base_ref', pullRequest.base.ref);
+            core.setOutput('head_ref', pullRequest.head.ref);
+            core.setOutput('head_sha', pullRequest.head.sha);
+            core.setOutput('pr_number', String(prNumber));
+
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || steps.pr-context.outputs.head_sha }}
+
+      - name: Fetch PR head ref
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number || steps.pr-context.outputs.pr_number || github.event.issue.number }}"
+          git fetch origin "pull/${PR_NUMBER}/head"
+
+      - name: Checkout action scripts
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: martinvuyk/modular-open-code-review
+          ref: ${{ inputs.action_ref }}
+          path: .mocr
+
+      - name: Install Open Code Review
+        uses: martinvuyk/modular-open-code-review/actions/setup-ocr@main
+        with:
+          ocr_version: ${{ inputs.ocr_version }}
+
+      - name: Restore codebase index cache
+        id: cbm-cache
+        uses: actions/cache/restore@v4.2.2
+        with:
+          path: ${{ runner.tool_cache }}/cbm-index
+          key: cbm-index-${{ github.event.pull_request.base.ref || steps.pr-context.outputs.base_ref }}-${{ github.event.pull_request.base.sha }}
+          restore-keys: |
+            cbm-index-${{ github.event.pull_request.base.ref || steps.pr-context.outputs.base_ref }}-
+
+      - name: Install codebase-memory-mcp
+        uses: martinvuyk/modular-open-code-review/actions/setup-codebase-memory@main
+        with:
+          cbm_version: ${{ inputs.cbm_version }}
+          cache_path: ${{ runner.tool_cache }}/cbm-index
+
+      - name: Incremental index (Phase A)
+        env:
+          CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
+        run: |
+          set -euo pipefail
+          codebase-memory-mcp cli index_repository "{\"repo_path\":\"${GITHUB_WORKSPACE}\"}"
+
+      - name: OCR preview and token estimate (Phase A)
+        id: preflight
+        env:
+          MODEL_OVERRIDE: ${{ inputs.model_override }}
+          MAX_ESTIMATED_TOKENS: ${{ inputs.max_estimated_tokens }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_REF="origin/${{ steps.pr-context.outputs.base_ref }}"
+            HEAD_SHA="${{ steps.pr-context.outputs.head_sha }}"
+          fi
+
+          echo "Preview review: ${HEAD_SHA} against ${BASE_REF}"
+          ocr review --preview --format json \
+            --from "$BASE_REF" \
+            --to "$HEAD_SHA" \
+            > /tmp/ocr-preview.json 2>/tmp/ocr-preview-stderr.log || true
+
+          cat /tmp/ocr-preview.json || echo '{}' > /tmp/ocr-preview.json
+
+          bash .mocr/scripts/estimate-review-tokens.sh \
+            /tmp/ocr-preview.json \
+            "$BASE_REF" \
+            "$HEAD_SHA" \
+            .mocr/config/models.cpu.json
+
+          bash .mocr/scripts/select-model.sh /tmp/ocr-tokens.env .mocr/config/models.cpu.json
+          # shellcheck disable=SC1091
+          source /tmp/ocr-model.env
+
+          if [ "$SKIP_REVIEW" = "true" ]; then
+            echo "skip_review=true" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=${SKIP_REASON}" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_review=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "max_model=${MAX_MODEL}" >> "$GITHUB_OUTPUT"
+          echo "max_quant=${MAX_QUANT}" >> "$GITHUB_OUTPUT"
+          echo "ocr_concurrency=${OCR_CONCURRENCY}" >> "$GITHUB_OUTPUT"
+          echo "estimated_tokens=${ESTIMATED_TOKENS}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip review — diff too large
+        if: steps.preflight.outputs.skip_review == 'true'
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const reason = `${{ steps.preflight.outputs.skip_reason }}` || 'estimated token budget exceeded';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `⚠️ **OpenCodeReview** skipped this PR on CPU: ${reason}.`,
+            });
+
+      - name: Start Modular MAX (Phase B)
+        if: steps.preflight.outputs.skip_review != 'true' && inputs.llm_url == ''
+        uses: martinvuyk/modular-open-code-review/actions/setup-modular-max@main
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          modular_version: ${{ inputs.modular_version }}
+          python_version: '3.12'
+          model: ${{ steps.preflight.outputs.max_model }}
+          quantization: ${{ steps.preflight.outputs.max_quant }}
+
+      - name: Configure OCR for review
+        if: steps.preflight.outputs.skip_review != 'true'
+        env:
+          CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
+        run: |
+          set -euo pipefail
+          LLM_URL="${{ inputs.llm_url }}"
+          if [ -z "$LLM_URL" ]; then
+            LLM_URL="http://127.0.0.1:8000/v1/chat/completions"
+          fi
+          ocr config set llm.url "$LLM_URL"
+          ocr config set llm.auth_token "local-max"
+          ocr config set llm.model "${{ steps.preflight.outputs.max_model }}"
+          ocr config set llm.use_anthropic false
+          ocr config set llm.extra_body '{"thinking": {"type": "disabled"}}'
+          ocr config set mcp_servers.codebase-memory.command codebase-memory-mcp
+          ocr config set mcp_servers.codebase-memory.setup 'codebase-memory-mcp cli list_projects'
+          ocr config set mcp_servers.codebase-memory.env "[\"CBM_CACHE_DIR=${CBM_CACHE_DIR}\",\"CBM_LOG_LEVEL=info\"]"
+
+      - name: Run Open Code Review
+        id: review
+        if: steps.preflight.outputs.skip_review != 'true'
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_REF="origin/${{ steps.pr-context.outputs.base_ref }}"
+            HEAD_SHA="${{ steps.pr-context.outputs.head_sha }}"
+          fi
+
+          ocr review \
+            --from "$BASE_REF" \
+            --to "$HEAD_SHA" \
+            --format json \
+            --concurrency "${{ steps.preflight.outputs.ocr_concurrency }}" \
+            > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log || true
+
+          echo "OCR stderr:"
+          cat /tmp/ocr-stderr.log || true
+
+          if [ -f /tmp/ocr-result.json ]; then
+            total=$(jq -r '.total_tokens // .usage.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            prompt=$(jq -r '.prompt_tokens // .usage.prompt_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            completion=$(jq -r '.completion_tokens // .usage.completion_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            echo "actual_total_tokens=${total:-}" >> "$GITHUB_OUTPUT"
+            echo "actual_prompt_tokens=${prompt:-}" >> "$GITHUB_OUTPUT"
+            echo "actual_completion_tokens=${completion:-}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post review comments
+        if: steps.preflight.outputs.skip_review != 'true' && inputs.post_comments
+        uses: martinvuyk/modular-open-code-review/actions/post-review-comments@main
+        with:
+          ocr_result_path: /tmp/ocr-result.json
+          ocr_stderr_path: /tmp/ocr-stderr.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Open Code Review"
+            echo "- Estimated tokens: ${{ steps.preflight.outputs.estimated_tokens }}"
+            if [ -n "${{ steps.review.outputs.actual_total_tokens }}" ]; then
+              echo "- Actual tokens: ${{ steps.review.outputs.actual_total_tokens }} (prompt: ${{ steps.review.outputs.actual_prompt_tokens }}, completion: ${{ steps.review.outputs.actual_completion_tokens }})"
+            else
+              echo "- Actual tokens: n/a (review skipped or failed)"
+            fi
+            echo "- Model: ${{ steps.preflight.outputs.max_model }}"
+            echo "- Concurrency: ${{ steps.preflight.outputs.ocr_concurrency }}"
+            echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
+          } >> "$GITHUB_STEP_SUMMARY"

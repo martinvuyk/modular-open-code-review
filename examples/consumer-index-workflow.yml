@@ -1,0 +1,15 @@
+# Consumer example — copy to .github/workflows/llm-index.yml in your repo.
+
+name: LLM Code Review Index
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  index:
+    uses: martinvuyk/modular-open-code-review/.github/workflows/index-base-branch.yml@main
