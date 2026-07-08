@@ -66,6 +66,7 @@ if [[ "${BUNDLE_COUNT:-0}" -gt "$max_bundles" ]]; then
 fi
 
 {
+  echo "ESTIMATED_TOKENS=${ESTIMATED_TOKENS}"
   echo "MAX_MODEL=${MAX_MODEL}"
   echo "MAX_QUANT=${MAX_QUANT}"
   echo "OCR_CONCURRENCY=${OCR_CONCURRENCY}"
