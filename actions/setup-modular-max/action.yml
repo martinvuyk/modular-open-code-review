@@ -1,5 +1,5 @@
 name: Setup Modular MAX
-description: Install pinned Modular MAX and start a local OpenAI-compatible server.
+description: Install pinned Modular MAX and serve the first working model from a candidate chain.
 inputs:
   modular_version:
     description: Modular pip package version
@@ -9,11 +9,16 @@ inputs:
     description: Python version for MAX
     required: false
     default: '3.12'
+  candidates_file:
+    description: JSON file with the ordered model candidate chain (from select-model.sh)
+    required: false
+    default: /tmp/ocr-candidates.json
   model:
-    description: Hugging Face model ID for max serve
-    required: true
+    description: Fallback single model ID when candidates_file is missing/empty
+    required: false
+    default: ''
   quantization:
-    description: Weight encoding (float32 for CPU safetensors, q4_k etc. for GGUF)
+    description: Fallback single-model encoding (used with `model`)
     required: false
     default: 'float32'
   port:
@@ -21,13 +26,27 @@ inputs:
     required: false
     default: '8000'
   serve_timeout:
-    description: Seconds to wait for max serve health endpoint (cold start can be slow)
+    description: Seconds to wait per candidate for the health endpoint (cold start can be slow)
     required: false
     default: '1800'
   cache:
     description: Cache the venv and model weights/compile artifacts across runs
     required: false
     default: 'true'
+  cache_key:
+    description: Extra key component busting the model cache when the chain changes
+    required: false
+    default: 'default'
+outputs:
+  served_model:
+    description: Model ID that actually served
+    value: ${{ steps.serve.outputs.served_model }}
+  served_quant:
+    description: Encoding of the served model
+    value: ${{ steps.serve.outputs.served_quant }}
+  served_concurrency:
+    description: Suggested OCR concurrency for the served model
+    value: ${{ steps.serve.outputs.served_concurrency }}
 runs:
   using: composite
   steps:
@@ -62,10 +81,31 @@ runs:
           "$VENV/bin/python" -m pip install --upgrade pip
           "$VENV/bin/pip" install "modular==${{ inputs.modular_version }}"
         fi
-        # Put the venv on PATH for all later steps (warm-cache, serve).
+        # Put the venv on PATH for all later steps (serve, gguf download).
         echo "$VENV/bin" >> "$GITHUB_PATH"
         "$VENV/bin/max" --version || true
 
+    - name: Prepare candidate chain
+      id: prep
+      shell: bash
+      run: |
+        set -euo pipefail
+        FILE="${{ inputs.candidates_file }}"
+        if [ ! -s "$FILE" ] || [ "$(jq 'length' "$FILE" 2>/dev/null || echo 0)" -eq 0 ]; then
+          # No chain provided: build a single-candidate file from `model`.
+          if [ -z "${{ inputs.model }}" ]; then
+            echo "::error::No candidates_file and no model input provided."
+            exit 1
+          fi
+          jq -n --arg id "${{ inputs.model }}" --arg q "${{ inputs.quantization }}" \
+            '[{id:$id, quantization:$q, concurrency:3}]' > "$FILE"
+        fi
+        echo "Candidate chain:"
+        jq -r '[.[].id] | join(" -> ")' "$FILE"
+
+    # One combined cache for the whole chain (HF downloads, compile artifacts,
+    # GGUF weights). restore-keys share a prefix so a partial/older warm cache
+    # is still reused. cache_key busts it when the chain definition changes.
     - name: Restore model caches
       id: model-cache
       if: inputs.cache == 'true'
@@ -74,57 +114,28 @@ runs:
         path: |
           ~/.cache/huggingface
           ${{ runner.tool_cache }}/modular-max-cache
-        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}-v2
+          ${{ runner.tool_cache }}/max-gguf
+        key: max-cpu-chain-${{ inputs.cache_key }}-${{ inputs.modular_version }}-v3
         restore-keys: |
-          max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-
-          max-cpu-models-${{ inputs.modular_version }}-v2
+          max-cpu-chain-${{ inputs.cache_key }}-
+          max-cpu-chain-
 
-    - name: Warm MAX cache (download + compile)
+    - name: Serve first working candidate
+      id: serve
       shell: bash
       env:
         HF_HOME: ~/.cache/huggingface
         HF_TOKEN: ${{ env.HF_TOKEN }}
         MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
-      run: |
-        set -euo pipefail
-        mkdir -p "$MODULAR_MAX_CACHE_DIR"
-        mapfile -d '' -t args < <(bash "${{ github.action_path }}/../../scripts/max-model-cli.sh" \
-          "${{ inputs.model }}" "${{ inputs.quantization }}")
-        max warm-cache "${args[@]}"
-
-    - name: Start max serve
-      id: max-serve
-      shell: bash
-      env:
-        HF_HOME: ~/.cache/huggingface
-        HF_TOKEN: ${{ env.HF_TOKEN }}
-        MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
-        MAX_MODEL: ${{ inputs.model }}
+        GGUF_DIR: ${{ runner.tool_cache }}/max-gguf
+        CANDIDATES_FILE: ${{ inputs.candidates_file }}
         MAX_PORT: ${{ inputs.port }}
-        MAX_QUANT: ${{ inputs.quantization }}
+        SERVE_TIMEOUT: ${{ inputs.serve_timeout }}
+        STOP_AT_FIRST: 'true'
       run: |
         set -euo pipefail
-        mkdir -p "$MODULAR_MAX_CACHE_DIR"
-        : > /tmp/max-serve.log
-        mapfile -d '' -t args < <(bash "${{ github.action_path }}/../../scripts/max-model-cli.sh" \
-          "$MAX_MODEL" "$MAX_QUANT")
-        # --allow-extra-request-fields (MAX >= 26.4): drop unknown top-level
-        # request fields with a warning instead of returning 400, so a stray
-        # client-side param never fails the whole review.
-        nohup max serve "${args[@]}" --allow-extra-request-fields >> /tmp/max-serve.log 2>&1 &
-        echo $! > /tmp/max-serve.pid
-        if ! bash "${{ github.action_path }}/../../scripts/wait-for-http.sh" \
-          "http://127.0.0.1:${MAX_PORT}/v1/health" "${{ inputs.serve_timeout }}"; then
-          echo "::error::max serve did not become ready in time"
-          if [[ -f /tmp/max-serve.log ]]; then
-            echo "---- tail /tmp/max-serve.log ----"
-            tail -n 80 /tmp/max-serve.log || true
-          fi
-          if [[ -f /tmp/max-serve.pid ]]; then
-            kill "$(cat /tmp/max-serve.pid)" 2>/dev/null || true
-          fi
-          exit 1
-        fi
+        mkdir -p "$MODULAR_MAX_CACHE_DIR" "$GGUF_DIR"
+        bash "${{ github.action_path }}/../../scripts/serve-candidates.sh"
 
     # success() only: a failed serve/compile must not persist a broken cache.
     # On PR runs the token is read-only, so this save is a no-op there; the
@@ -136,4 +147,5 @@ runs:
         path: |
           ~/.cache/huggingface
           ${{ runner.tool_cache }}/modular-max-cache
-        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}-v2
+          ${{ runner.tool_cache }}/max-gguf
+        key: max-cpu-chain-${{ inputs.cache_key }}-${{ inputs.modular_version }}-v3
