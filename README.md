@@ -69,8 +69,9 @@ OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX run
 | `model_override` | `""` | Force a Hugging Face model ID |
 | `max_estimated_tokens` | `500000` | Skip review when preflight estimate exceeds this |
 | `post_comments` | `true` | Post GitHub review comments |
-| `llm_url` | `""` | External OpenAI-compatible API (skips local MAX) |
+| `llm_url` | `""` | External OpenAI-compatible API (skips local MAX, its caching, and RAM gating). Set `model_override` to name the external model. |
 | `llm_extra_body` | `""` | JSON merged into every LLM request. Only for thinking-capable models, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}`. Leave empty for Qwen2.5. |
+| `cache_models` | `true` | Cache the MAX venv + weights/compile artifacts (local MAX only; no effect with `llm_url`) |
 | `action_ref` | `main` | Ref of this repo for scripts |
 
 ### `max_estimated_tokens`
@@ -154,8 +155,13 @@ MAX downloads weights from Hugging Face and compiles them for your device. Both 
 
 | Cache path | Contents |
 |------------|----------|
+| `~/.venv-max` | Python virtualenv with Modular MAX installed (skips `pip install` on a hit; keyed on exact Python patch + MAX version) |
 | `~/.cache/huggingface` | Downloaded model weights |
-| `$RUNNER_TOOL_CACHE/modular-max-cache` | MAX compile cache (`MODULAR_MAX_CACHE_DIR`) |
+| `$RUNNER_TOOL_CACHE/modular-max-cache` | MAX compile cache / MEF (`MODULAR_MAX_CACHE_DIR`) |
+
+The warm workflow (on push to `main`) is what populates these caches; PR runs restore them read-only. Caches are only saved on success, so a failed compile never poisons the key.
+
+Caching is optional: set `cache_models: false` to disable it, or use `llm_url` to point at an external OpenAI-compatible API — in that case local MAX, its caches, and the RAM pre-flight are all skipped, and `model_override` names the model sent to the external API.
 
 The `setup-modular-max` action runs [`max warm-cache`](https://docs.modular.com/max/cli/warm-cache/) before `max serve`, saves caches even when a job fails after download, and waits up to 30 minutes for the health endpoint on cold start.
 

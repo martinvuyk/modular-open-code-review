@@ -15,6 +15,9 @@ export LC_ALL=C
 TOKENS_ENV="${1:-/tmp/ocr-tokens.env}"
 CONFIG="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config/models.cpu.json}"
 MODEL_OVERRIDE="${MODEL_OVERRIDE:-}"
+# When an external LLM URL is used there is no local model to load, so skip all
+# RAM gating (the runner never holds the weights).
+EXTERNAL_LLM="${EXTERNAL_LLM:-false}"
 
 if [[ ! -f "$TOKENS_ENV" ]]; then
   echo "Missing token estimate file: $TOKENS_ENV" >&2
@@ -77,7 +80,30 @@ if [[ "${ESTIMATED_TOKENS:-0}" -gt "$max_tokens" ]]; then
   REASON="Estimated tokens (${ESTIMATED_TOKENS}) exceed max (${max_tokens})"
 fi
 
-if [[ -n "$MODEL_OVERRIDE" ]]; then
+# Token estimate picks the starting tier (and the RAM-fit fallback order).
+if [[ "${ESTIMATED_TOKENS:-0}" -lt "$small_tokens" ]]; then
+  tier=small
+  candidates=(small)
+elif [[ "${ESTIMATED_TOKENS:-0}" -le "$medium_tokens" ]]; then
+  tier=medium
+  candidates=(medium small)
+else
+  tier=large_load
+  candidates=(large_load medium small)
+fi
+
+if [[ "$EXTERNAL_LLM" == "true" ]]; then
+  # External API: no local weights, so no RAM estimate or fit check. Use the
+  # override as the model name if given, else the tier default; concurrency
+  # still follows the token tier.
+  if [[ -n "$MODEL_OVERRIDE" ]]; then
+    MAX_MODEL="$MODEL_OVERRIDE"
+  else
+    MAX_MODEL=$(jq -r ".models.${tier}.id" "$CONFIG")
+  fi
+  MAX_QUANT="${MODEL_OVERRIDE_QUANT:-}"
+  OCR_CONCURRENCY=$(jq -r ".models.${tier}.concurrency" "$CONFIG")
+elif [[ -n "$MODEL_OVERRIDE" ]]; then
   MAX_MODEL="$MODEL_OVERRIDE"
   MAX_QUANT="${MODEL_OVERRIDE_QUANT:-float32}"
   OCR_CONCURRENCY=3
@@ -87,29 +113,21 @@ if [[ -n "$MODEL_OVERRIDE" ]]; then
     echo "WARNING: $REASON" >&2
   fi
 else
-  # Token estimate picks the starting tier; RAM fit downgrades from there.
-  if [[ "${ESTIMATED_TOKENS:-0}" -lt "$small_tokens" ]]; then
-    candidates=(small)
-  elif [[ "${ESTIMATED_TOKENS:-0}" -le "$medium_tokens" ]]; then
-    candidates=(medium small)
-  else
-    candidates=(large_load medium small)
-  fi
-
+  # Local MAX: RAM fit downgrades through the candidate tiers.
   CHOSEN=""
-  for tier in "${candidates[@]}"; do
-    cid=$(jq -r ".models.${tier}.id" "$CONFIG")
-    cq=$(jq -r ".models.${tier}.quantization" "$CONFIG")
+  for cand in "${candidates[@]}"; do
+    cid=$(jq -r ".models.${cand}.id" "$CONFIG")
+    cq=$(jq -r ".models.${cand}.quantization" "$CONFIG")
     need=$(required_ram_gib "$cid" "$cq")
     if [[ "$free_ram_gb" -ge "$need" ]]; then
       MAX_MODEL="$cid"
       MAX_QUANT="$cq"
-      OCR_CONCURRENCY=$(jq -r ".models.${tier}.concurrency" "$CONFIG")
+      OCR_CONCURRENCY=$(jq -r ".models.${cand}.concurrency" "$CONFIG")
       REQUIRED_RAM_GB="$need"
-      CHOSEN="$tier"
+      CHOSEN="$cand"
       break
     fi
-    echo "Tier ${tier} (${cid}, ${cq}) needs ~${need}GB, only ${free_ram_gb}GB free; trying smaller." >&2
+    echo "Tier ${cand} (${cid}, ${cq}) needs ~${need}GB, only ${free_ram_gb}GB free; trying smaller." >&2
     SMALLEST_ID="$cid"; SMALLEST_QUANT="$cq"; SMALLEST_NEED="$need"
   done
 

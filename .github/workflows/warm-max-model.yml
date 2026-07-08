@@ -42,6 +42,30 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Resolve Python version
+        id: pyver
+        run: echo "version=$(python -c 'import platform; print(platform.python_version())')" >> "$GITHUB_OUTPUT"
+
+      # Shares the same key as the setup-modular-max action, so the review jobs
+      # reuse this venv (and vice versa) and never re-run pip install.
+      - name: Cache MAX virtualenv
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.venv-max
+          key: venv-max-${{ runner.os }}-py${{ steps.pyver.outputs.version }}-${{ inputs.modular_version }}
+
+      - name: Install Modular MAX
+        run: |
+          set -euo pipefail
+          VENV="$HOME/.venv-max"
+          if [ ! -x "$VENV/bin/max" ]; then
+            python -m venv "$VENV"
+            "$VENV/bin/python" -m pip install --upgrade pip
+            "$VENV/bin/pip" install "modular==${{ inputs.modular_version }}"
+          fi
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          "$VENV/bin/max" --version || true
+
       - name: Restore model caches
         id: model-cache
         uses: actions/cache/restore@v6.1.0
@@ -49,9 +73,9 @@ jobs:
           path: |
             ~/.cache/huggingface
             ${{ runner.tool_cache }}/modular-max-cache
-          key: max-cpu-models-${{ inputs.modular_version }}
+          key: max-cpu-models-${{ inputs.modular_version }}-v2
           restore-keys: |
-            max-cpu-models-
+            max-cpu-models-${{ inputs.modular_version }}-v2
 
       - name: Warm models from config
         env:
@@ -64,11 +88,13 @@ jobs:
           mkdir -p "$MODULAR_MAX_CACHE_DIR"
           bash .mocr/scripts/warm-max-models.sh .mocr/config/models.cpu.json
 
+      # success() only: never persist a half-populated cache from a failed
+      # compile (that previously poisoned the key with an empty archive).
       - name: Save model caches
-        if: always() && steps.model-cache.outputs.cache-hit != 'true'
+        if: success() && steps.model-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6.1.0
         with:
           path: |
             ~/.cache/huggingface
             ${{ runner.tool_cache }}/modular-max-cache
-          key: max-cpu-models-${{ inputs.modular_version }}
+          key: max-cpu-models-${{ inputs.modular_version }}-v2

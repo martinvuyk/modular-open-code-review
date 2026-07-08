@@ -48,6 +48,11 @@ on:
         required: false
         type: string
         default: ''
+      cache_models:
+        description: Cache the MAX venv + model weights/compile artifacts (local MAX only)
+        required: false
+        type: boolean
+        default: true
       llm_extra_body:
         description: >-
           Optional JSON merged into every LLM request (OCR llm.extra_body).
@@ -141,6 +146,7 @@ jobs:
         env:
           MODEL_OVERRIDE: ${{ inputs.model_override }}
           MAX_ESTIMATED_TOKENS: ${{ inputs.max_estimated_tokens }}
+          EXTERNAL_LLM: ${{ inputs.llm_url != '' }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
@@ -206,6 +212,7 @@ jobs:
           python_version: '3.12'
           model: ${{ steps.preflight.outputs.max_model }}
           quantization: ${{ steps.preflight.outputs.max_quant }}
+          cache: ${{ inputs.cache_models }}
 
       - name: Configure OCR for review
         if: steps.preflight.outputs.skip_review != 'true'
