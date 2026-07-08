@@ -10,5 +10,18 @@ inputs:
     required: false
     default: /tmp/ocr-stderr.log
 runs:
-  using: node24
-  main: post-review.js
+  using: composite
+  steps:
+    # post-review.js is a github-script module (exports an async fn taking
+    # { github, context, core }); it must be invoked via github-script, not run
+    # as a standalone node entrypoint (which would just define the export and
+    # exit without posting anything).
+    - uses: actions/github-script@v9.0.0
+      env:
+        POST_REVIEW_DIR: ${{ github.action_path }}
+        OCR_RESULT_PATH: ${{ inputs.ocr_result_path }}
+        OCR_STDERR_PATH: ${{ inputs.ocr_stderr_path }}
+      with:
+        script: |
+          const fn = require(`${process.env.POST_REVIEW_DIR}/post-review.js`);
+          await fn({ github, context, core });

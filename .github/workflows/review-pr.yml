@@ -242,6 +242,12 @@ jobs:
       - name: Run Open Code Review
         id: review
         if: steps.preflight.outputs.skip_review != 'true'
+        env:
+          # OCR runs the MCP server's setup command (`cli list_projects`) as a
+          # child process. It applies mcp_servers.*.env to the server, not the
+          # setup command, so export CBM_CACHE_DIR here too — otherwise setup
+          # falls back to ~/.cache/codebase-memory-mcp and can't find the index.
+          CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
@@ -271,13 +277,16 @@ jobs:
           cat /tmp/ocr-stderr.log || true
           echo "ocr_exit_code=${rc}" >> "$GITHUB_OUTPUT"
 
+          # OCR emits token counts under .summary (json:"total_tokens" etc.).
           if [ -s /tmp/ocr-result.json ]; then
-            total=$(jq -r '.total_tokens // .usage.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            prompt=$(jq -r '.prompt_tokens // .usage.prompt_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            completion=$(jq -r '.completion_tokens // .usage.completion_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            total=$(jq -r '.summary.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            input=$(jq -r '.summary.input_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            output=$(jq -r '.summary.output_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            files=$(jq -r '.summary.files_reviewed // empty' /tmp/ocr-result.json 2>/dev/null || true)
             echo "actual_total_tokens=${total:-}" >> "$GITHUB_OUTPUT"
-            echo "actual_prompt_tokens=${prompt:-}" >> "$GITHUB_OUTPUT"
-            echo "actual_completion_tokens=${completion:-}" >> "$GITHUB_OUTPUT"
+            echo "actual_input_tokens=${input:-}" >> "$GITHUB_OUTPUT"
+            echo "actual_output_tokens=${output:-}" >> "$GITHUB_OUTPUT"
+            echo "files_reviewed=${files:-}" >> "$GITHUB_OUTPUT"
           fi
 
           if [ "$rc" -ne 0 ]; then
@@ -304,7 +313,8 @@ jobs:
             echo "## Open Code Review"
             echo "- Estimated tokens: ${{ steps.preflight.outputs.estimated_tokens }}"
             if [ -n "${{ steps.review.outputs.actual_total_tokens }}" ]; then
-              echo "- Actual tokens: ${{ steps.review.outputs.actual_total_tokens }} (prompt: ${{ steps.review.outputs.actual_prompt_tokens }}, completion: ${{ steps.review.outputs.actual_completion_tokens }})"
+              echo "- Actual tokens: ${{ steps.review.outputs.actual_total_tokens }} (input: ${{ steps.review.outputs.actual_input_tokens }}, output: ${{ steps.review.outputs.actual_output_tokens }})"
+              echo "- Files reviewed: ${{ steps.review.outputs.files_reviewed || 'n/a' }}"
             else
               echo "- Actual tokens: n/a (review skipped or failed)"
             fi
