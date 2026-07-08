@@ -15,18 +15,18 @@
   },
   "models": {
     "small": {
-      "id": "Qwen/Qwen2.5-3B-Instruct-GGUF",
-      "quantization": "q4_k",
+      "id": "Qwen/Qwen2.5-3B-Instruct",
+      "quantization": "",
       "concurrency": 3
     },
     "medium": {
-      "id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
-      "quantization": "q4_k",
+      "id": "Qwen/Qwen2.5-7B-Instruct",
+      "quantization": "",
       "concurrency": 4
     },
     "large_load": {
-      "id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
-      "quantization": "q4_k",
+      "id": "Qwen/Qwen2.5-7B-Instruct",
+      "quantization": "",
       "concurrency": 2
     }
   }

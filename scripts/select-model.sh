@@ -36,7 +36,7 @@ fi
 
 if [[ -n "$MODEL_OVERRIDE" ]]; then
   MAX_MODEL="$MODEL_OVERRIDE"
-  MAX_QUANT="q4_k"
+  MAX_QUANT=""
   OCR_CONCURRENCY=3
 else
   if [[ "${ESTIMATED_TOKENS:-0}" -lt "$small_tokens" ]]; then

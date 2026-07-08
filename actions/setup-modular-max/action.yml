@@ -13,9 +13,9 @@ inputs:
     description: Hugging Face model ID for max serve
     required: true
   quantization:
-    description: Quantization encoding for GGUF models
+    description: Quantization encoding for GGUF models (leave empty for safetensors)
     required: false
-    default: 'q4_k'
+    default: ''
   port:
     description: Local port for max serve
     required: false
@@ -47,9 +47,9 @@ runs:
         path: |
           ~/.cache/huggingface
           ${{ runner.tool_cache }}/modular-max-cache
-        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}
+        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization != '' && inputs.quantization || 'safetensors' }}-${{ inputs.modular_version }}
         restore-keys: |
-          max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-
+          max-cpu-${{ inputs.model }}-${{ inputs.quantization != '' && inputs.quantization || 'safetensors' }}-
           max-cpu-${{ inputs.model }}-
           max-cpu-models-${{ inputs.modular_version }}
 
@@ -59,14 +59,12 @@ runs:
         HF_HOME: ~/.cache/huggingface
         HF_TOKEN: ${{ env.HF_TOKEN }}
         MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
-        HF_HUB_ENABLE_HF_TRANSFER: '1'
       run: |
         set -euo pipefail
         mkdir -p "$MODULAR_MAX_CACHE_DIR"
-        max warm-cache \
-          --devices=cpu \
-          --model "${{ inputs.model }}" \
-          --quantization-encoding "${{ inputs.quantization }}"
+        mapfile -d '' -t args < <(bash "${{ github.action_path }}/../../scripts/max-model-cli.sh" \
+          "${{ inputs.model }}" "${{ inputs.quantization }}")
+        max warm-cache "${args[@]}"
 
     - name: Start max serve
       id: max-serve
@@ -82,11 +80,9 @@ runs:
         set -euo pipefail
         mkdir -p "$MODULAR_MAX_CACHE_DIR"
         : > /tmp/max-serve.log
-        nohup max serve \
-          --devices=cpu \
-          --model "$MAX_MODEL" \
-          --quantization-encoding "$MAX_QUANT" \
-          >> /tmp/max-serve.log 2>&1 &
+        mapfile -d '' -t args < <(bash "${{ github.action_path }}/../../scripts/max-model-cli.sh" \
+          "$MAX_MODEL" "$MAX_QUANT")
+        nohup max serve "${args[@]}" >> /tmp/max-serve.log 2>&1 &
         echo $! > /tmp/max-serve.pid
         if ! bash "${{ github.action_path }}/../../scripts/wait-for-http.sh" \
           "http://127.0.0.1:${MAX_PORT}/v1/health" "${{ inputs.serve_timeout }}"; then
@@ -108,4 +104,4 @@ runs:
         path: |
           ~/.cache/huggingface
           ${{ runner.tool_cache }}/modular-max-cache
-        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}
+        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization != '' && inputs.quantization || 'safetensors' }}-${{ inputs.modular_version }}

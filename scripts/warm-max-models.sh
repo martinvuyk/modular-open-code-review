@@ -5,6 +5,7 @@ set -euo pipefail
 CONFIG="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config/models.cpu.json}"
 MODULAR_VERSION="${MODULAR_VERSION:-26.4.0}"
 DEVICES="${MAX_DEVICES:-cpu}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "Missing config: $CONFIG" >&2
@@ -36,11 +37,9 @@ max --version
 for spec in "${MODEL_SPECS[@]}"; do
   model="${spec%%$'\t'*}"
   quant="${spec#*$'\t'}"
-  echo "Warming MAX cache for ${model} (quant=${quant}, devices=${DEVICES})..."
-  max warm-cache \
-    --devices="$DEVICES" \
-    --model "$model" \
-    --quantization-encoding "$quant"
+  echo "Warming MAX cache for ${model} (quant=${quant:-none}, devices=${DEVICES})..."
+  mapfile -d '' -t args < <(bash "$SCRIPT_DIR/max-model-cli.sh" "$model" "$quant")
+  max warm-cache "${args[@]}"
 done
 
 echo "MAX model cache warm complete."

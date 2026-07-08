@@ -59,7 +59,6 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
           MODULAR_VERSION: ${{ inputs.modular_version }}
-          HF_HUB_ENABLE_HF_TRANSFER: '1'
         run: |
           set -euo pipefail
           mkdir -p "$MODULAR_MAX_CACHE_DIR"

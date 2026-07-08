@@ -4,7 +4,7 @@ Plug-and-play GitHub Actions for automated PR code review using:
 
 - [Open Code Review](https://github.com/alibaba/open-code-review) (OCR) v1.7.4
 - [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) v0.8.1
-- [Modular MAX](https://github.com/modular/modular) 26.4.0 with Qwen GGUF models (no Hugging Face license gate)
+- [Modular MAX](https://github.com/modular/modular) 26.4.0 with Qwen models (Apache 2.0, no license gate)
 
 Runs on pinned **ubuntu-24.04** with diff-aware model selection and a preflight phase before loading the LLM.
 
@@ -91,7 +91,7 @@ jobs:
   review:
     uses: martinvuyk/modular-open-code-review/.github/workflows/review-pr.yml@main
     with:
-      model_override: Qwen/Qwen2.5-7B-Instruct-GGUF
+      model_override: Qwen/Qwen2.5-7B-Instruct
       max_estimated_tokens: '300000'
     secrets: inherit
 ```
@@ -113,8 +113,8 @@ Default LLM tiers (see [`config/models.cpu.json`](config/models.cpu.json)):
 
 | Tier | Model |
 |------|-------|
-| Small PRs | `Qwen/Qwen2.5-3B-Instruct-GGUF` |
-| Medium/large | `Qwen/Qwen2.5-7B-Instruct-GGUF` |
+| Small PRs | `Qwen/Qwen2.5-3B-Instruct` |
+| Medium/large | `Qwen/Qwen2.5-7B-Instruct` (when ≥14 GB RAM free) |
 
 Qwen models use Apache 2.0 and do not require a Hugging Face license acceptance flow (unlike Meta Llama).
 
