@@ -1,0 +1,75 @@
+name: Warm MAX model caches
+
+on:
+  workflow_call:
+    inputs:
+      modular_version:
+        description: Modular pip package version
+        required: false
+        type: string
+        default: '26.4.0'
+      runner:
+        description: GitHub-hosted runner label
+        required: false
+        type: string
+        default: ubuntu-24.04
+      action_ref:
+        description: Git ref of modular-open-code-review for scripts/config
+        required: false
+        type: string
+        default: main
+    secrets:
+      HF_TOKEN:
+        description: Hugging Face hub token (optional for ungated models)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - name: Checkout action scripts
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: martinvuyk/modular-open-code-review
+          ref: ${{ inputs.action_ref }}
+          path: .mocr
+
+      - name: Setup Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: '3.12'
+
+      - name: Restore model caches
+        id: model-cache
+        uses: actions/cache/restore@v4.2.2
+        with:
+          path: |
+            ~/.cache/huggingface
+            ${{ runner.tool_cache }}/modular-max-cache
+          key: max-cpu-models-${{ inputs.modular_version }}
+          restore-keys: |
+            max-cpu-models-
+
+      - name: Warm models from config
+        env:
+          HF_HOME: ~/.cache/huggingface
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
+          MODULAR_VERSION: ${{ inputs.modular_version }}
+          HF_HUB_ENABLE_HF_TRANSFER: '1'
+        run: |
+          set -euo pipefail
+          mkdir -p "$MODULAR_MAX_CACHE_DIR"
+          bash .mocr/scripts/warm-max-models.sh .mocr/config/models.cpu.json
+
+      - name: Save model caches
+        if: always() && steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4.2.2
+        with:
+          path: |
+            ~/.cache/huggingface
+            ${{ runner.tool_cache }}/modular-max-cache
+          key: max-cpu-models-${{ inputs.modular_version }}

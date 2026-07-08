@@ -1,0 +1,16 @@
+# Consumer example — copy to .github/workflows/llm-warm-max.yml in your repo.
+
+name: LLM Warm MAX Cache
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    uses: martinvuyk/modular-open-code-review/.github/workflows/warm-max-model.yml@main
+    secrets: inherit

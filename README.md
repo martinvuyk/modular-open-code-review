@@ -138,10 +138,26 @@ This workflow uses `pull_request_target` so secrets and cache are available for 
 | Symptom | Fix |
 |---------|-----|
 | OOM / runner killed | Workflow auto-downgrades to smaller models; reduce `max_estimated_tokens` or set `model_override` to a smaller model |
-| Slow first run | Enable the index warmer on `push` to `main` |
+| Slow first run | Run the index warmer and [MAX cache warmer](#max-model-cache) on `push` to `main` |
 | Cache miss on PR | Ensure index workflow ran on the current base branch SHA |
 | Review skipped | PR diff estimate exceeded `max_estimated_tokens` |
-| `max serve` timeout | Check `/tmp/max-serve.log` in job artifacts; verify model fits in RAM |
+| `max serve` timeout | First CPU cold start can take 20+ minutes (download + compile). Check job log for `tail /tmp/max-serve.log`. Run the MAX cache warmer on `main` so later PRs restore caches. |
+
+## MAX model cache
+
+MAX downloads weights from Hugging Face and compiles them for your device. Both are cached via GitHub Actions `actions/cache`:
+
+| Cache path | Contents |
+|------------|----------|
+| `~/.cache/huggingface` | Downloaded model weights |
+| `$RUNNER_TOOL_CACHE/modular-max-cache` | MAX compile cache (`MODULAR_MAX_CACHE_DIR`) |
+
+The `setup-modular-max` action runs [`max warm-cache`](https://docs.modular.com/max/cli/warm-cache/) before `max serve`, saves caches even when a job fails after download, and waits up to 30 minutes for the health endpoint on cold start.
+
+**Recommended:** add the MAX cache warmer (copy [`examples/consumer-warm-max-workflow.yml`](examples/consumer-warm-max-workflow.yml) to `.github/workflows/llm-warm-max.yml`) so pushes to `main` pre-download and compile the tier models from [`config/models.cpu.json`](config/models.cpu.json). PR reviews then restore that cache instead of starting cold.
+
+**Alternatives:** use `llm_url` to point at an external API and skip local MAX; or run [`modular/max-full`](https://docs.modular.com/max/container/) in Docker with the same volume mounts (GPU-oriented, but supports `--devices cpu`).
+
 
 ## Repository layout
 
@@ -149,7 +165,7 @@ This workflow uses `pull_request_target` so secrets and cache are available for 
 actions/           Composite actions (setup-ocr, setup-cbm, setup-max, post-comments)
 scripts/           Shell helpers (estimate tokens, select model, cache index)
 config/            Pinned versions and model tiers
-.github/workflows/ Reusable workflows (review-pr, index-base-branch)
+.github/workflows/ Reusable workflows (review-pr, index-base-branch, warm-max-model)
 examples/          Copy-paste consumer workflows
 ```
 
