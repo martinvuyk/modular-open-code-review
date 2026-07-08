@@ -1,0 +1,13 @@
+name: LLM Code Review Index
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  index:
+    uses: ./.github/workflows/index-base-branch.yml

@@ -13,7 +13,6 @@ fi
 
 # Written by estimate-review-tokens.sh (KEY=value lines).
 BUNDLE_COUNT=$(grep -m1 '^BUNDLE_COUNT=' "$TOKENS_ENV" | cut -d= -f2-)
-FILE_COUNT=$(grep -m1 '^FILE_COUNT=' "$TOKENS_ENV" | cut -d= -f2-)
 ESTIMATED_TOKENS=$(grep -m1 '^ESTIMATED_TOKENS=' "$TOKENS_ENV" | cut -d= -f2-)
 
 small_tokens=$(jq -r '.thresholds.small_tokens' "$CONFIG")
