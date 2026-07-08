@@ -10,7 +10,7 @@ deadline=$((SECONDS + TIMEOUT))
 
 echo "Waiting for ${URL} (timeout ${TIMEOUT}s)..."
 while (( SECONDS < deadline )); do
-  if curl -fsS "$URL" >/dev/null 2>&1; then
+  if curl -k -fsS "$URL" >/dev/null 2>&1; then
     echo "Endpoint ready: ${URL}"
     exit 0
   fi
