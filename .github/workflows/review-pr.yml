@@ -171,6 +171,8 @@ jobs:
           echo "max_quant=${MAX_QUANT}" >> "$GITHUB_OUTPUT"
           echo "ocr_concurrency=${OCR_CONCURRENCY}" >> "$GITHUB_OUTPUT"
           echo "estimated_tokens=${ESTIMATED_TOKENS}" >> "$GITHUB_OUTPUT"
+          echo "free_ram_gb=${FREE_RAM_GB}" >> "$GITHUB_OUTPUT"
+          echo "required_ram_gb=${REQUIRED_RAM_GB}" >> "$GITHUB_OUTPUT"
 
       - name: Skip review — diff too large
         if: steps.preflight.outputs.skip_review == 'true'
@@ -265,7 +267,8 @@ jobs:
             else
               echo "- Actual tokens: n/a (review skipped or failed)"
             fi
-            echo "- Model: ${{ steps.preflight.outputs.max_model }}"
+            echo "- Model: ${{ steps.preflight.outputs.max_model }} (${{ steps.preflight.outputs.max_quant }})"
+            echo "- Estimated RAM: ~${{ steps.preflight.outputs.required_ram_gb }} GB needed / ${{ steps.preflight.outputs.free_ram_gb }} GB free"
             echo "- Concurrency: ${{ steps.preflight.outputs.ocr_concurrency }}"
             echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
           } >> "$GITHUB_STEP_SUMMARY"

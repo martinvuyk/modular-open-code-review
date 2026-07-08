@@ -113,10 +113,14 @@ Default LLM tiers (see [`config/models.cpu.json`](config/models.cpu.json)):
 
 | Tier | Model |
 |------|-------|
-| Small PRs | `Qwen/Qwen2.5-3B-Instruct` (`float32` on CPU) |
-| Medium/large | Same 3B model, lower concurrency (7B `float32` does not fit 16 GB runners) |
+| Small PRs | `Qwen/Qwen2.5-0.5B-Instruct` (`float32` on CPU, ~2 GB RAM) |
+| Medium/large | `Qwen/Qwen2.5-1.5B-Instruct` (`float32`, ~6 GB RAM), lower concurrency |
 
-Qwen models use Apache 2.0 and do not require a Hugging Face license acceptance flow (unlike Meta Llama).
+These sizes are chosen so the `float32` weights fit comfortably in the 16 GB of a standard runner. Larger Qwen sizes at `float32` are much heavier (3B ≈ 12–14 GB, 7B ≈ 28 GB) and OOM-kill during compilation on 16 GB runners; override the model only if you run on a larger runner.
+
+Before starting MAX, [`select-model.sh`](scripts/select-model.sh) pre-flights the memory fit: it reads the model's exact parameter count from the Hugging Face API (falling back to parsing the size out of the model id), multiplies by the bytes-per-weight of the target encoding, and applies `ram_estimate.safety_factor` + `ram_estimate.base_overhead_gb` from [`config/models.cpu.json`](config/models.cpu.json). If the chosen tier does not fit `MemAvailable`, it downgrades to a smaller tier; if even the smallest does not fit, it skips the review with a clear reason instead of letting MAX OOM mid-compile. The estimate (needed vs. free) is printed in the job summary.
+
+The default `0.5B`, `1.5B`, and `7B` Qwen2.5 instruct models are Apache 2.0 and need no Hugging Face license acceptance flow. Note that `Qwen/Qwen2.5-3B-Instruct` is **not** Apache 2.0 (Qwen Research License, non-commercial), so it is intentionally not a default.
 
 ## Secrets
 
@@ -157,6 +161,23 @@ The `setup-modular-max` action runs [`max warm-cache`](https://docs.modular.com/
 **Recommended:** add the MAX cache warmer (copy [`examples/consumer-warm-max-workflow.yml`](examples/consumer-warm-max-workflow.yml) to `.github/workflows/llm-warm-max.yml`) so pushes to `main` pre-download and compile the tier models from [`config/models.cpu.json`](config/models.cpu.json). PR reviews then restore that cache instead of starting cold.
 
 **Alternatives:** use `llm_url` to point at an external API and skip local MAX; or run [`modular/max-full`](https://docs.modular.com/max/container/) in Docker with the same volume mounts (GPU-oriented, but supports `--devices cpu`).
+
+### Why we compile instead of downloading a prebuilt model
+
+There is no downloadable "prebuilt binary" for a chosen model. MAX's compiled artifact is a **MEF** (Modular Executable Format) file stored in `MODULAR_MAX_CACHE_DIR`. Per [Modular](https://forum.modular.com/t/how-to-import-and-run-an-exported-max-model-from-mef/580), the serialized MEF cache is **device- and MAX-version-specific and not portable**, so Modular does not publish per-model compiled artifacts to download.
+
+Our "download once, fall back to compile" strategy is therefore implemented with the GitHub Actions cache itself: `max warm-cache` compiles the model once, we persist `MODULAR_MAX_CACHE_DIR`, and later runs restore it (cache hit = fast path, cache miss = recompile). This is the supported equivalent of shipping a prebuilt binary within a single runner OS + MAX version.
+
+A manual MEF export/import path also exists but Modular considers it "largely obsolete" now that automatic graph caching is reliable, so we do **not** use it. Kept here for reference only:
+
+```python
+# DISABLED / reference only — MEF is not portable across devices or MAX versions.
+# from max.engine import InferenceSession
+# session = InferenceSession()
+# compiled = session.compile(model_path)   # produce CompiledModel
+# compiled.export_mef("qwen-cpu.mef")       # serialize compiled artifact
+# session.load("qwen-cpu.mef")              # later: load without recompiling
+```
 
 
 ## Repository layout
