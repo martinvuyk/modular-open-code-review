@@ -13,9 +13,9 @@ inputs:
     description: Hugging Face model ID for max serve
     required: true
   quantization:
-    description: Quantization encoding for GGUF models (leave empty for safetensors)
+    description: Weight encoding (float32 for CPU safetensors, q4_k etc. for GGUF)
     required: false
-    default: ''
+    default: 'float32'
   port:
     description: Local port for max serve
     required: false
@@ -47,9 +47,9 @@ runs:
         path: |
           ~/.cache/huggingface
           ${{ runner.tool_cache }}/modular-max-cache
-        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization != '' && inputs.quantization || 'safetensors' }}-${{ inputs.modular_version }}
+        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}
         restore-keys: |
-          max-cpu-${{ inputs.model }}-${{ inputs.quantization != '' && inputs.quantization || 'safetensors' }}-
+          max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-
           max-cpu-${{ inputs.model }}-
           max-cpu-models-${{ inputs.modular_version }}
 
@@ -104,4 +104,4 @@ runs:
         path: |
           ~/.cache/huggingface
           ${{ runner.tool_cache }}/modular-max-cache
-        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization != '' && inputs.quantization || 'safetensors' }}-${{ inputs.modular_version }}
+        key: max-cpu-${{ inputs.model }}-${{ inputs.quantization }}-${{ inputs.modular_version }}

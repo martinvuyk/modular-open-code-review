@@ -16,17 +16,17 @@
   "models": {
     "small": {
       "id": "Qwen/Qwen2.5-3B-Instruct",
-      "quantization": "",
+      "quantization": "float32",
       "concurrency": 3
     },
     "medium": {
-      "id": "Qwen/Qwen2.5-7B-Instruct",
-      "quantization": "",
+      "id": "Qwen/Qwen2.5-3B-Instruct",
+      "quantization": "float32",
       "concurrency": 4
     },
     "large_load": {
-      "id": "Qwen/Qwen2.5-7B-Instruct",
-      "quantization": "",
+      "id": "Qwen/Qwen2.5-3B-Instruct",
+      "quantization": "float32",
       "concurrency": 2
     }
   }

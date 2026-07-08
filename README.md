@@ -113,8 +113,8 @@ Default LLM tiers (see [`config/models.cpu.json`](config/models.cpu.json)):
 
 | Tier | Model |
 |------|-------|
-| Small PRs | `Qwen/Qwen2.5-3B-Instruct` |
-| Medium/large | `Qwen/Qwen2.5-7B-Instruct` (when ≥14 GB RAM free) |
+| Small PRs | `Qwen/Qwen2.5-3B-Instruct` (`float32` on CPU) |
+| Medium/large | Same 3B model, lower concurrency (7B `float32` does not fit 16 GB runners) |
 
 Qwen models use Apache 2.0 and do not require a Hugging Face license acceptance flow (unlike Meta Llama).
 
