@@ -53,6 +53,13 @@ on:
         required: false
         type: boolean
         default: true
+      allow_gated_models:
+        description: >-
+          Include license-gated candidates (e.g. Llama 3.1) in the local model
+          fallback chain. Default false keeps only ungated Apache-2.0 models.
+        required: false
+        type: boolean
+        default: false
       llm_extra_body:
         description: >-
           Optional JSON merged into every LLM request (OCR llm.extra_body).
@@ -147,6 +154,7 @@ jobs:
           MODEL_OVERRIDE: ${{ inputs.model_override }}
           MAX_ESTIMATED_TOKENS: ${{ inputs.max_estimated_tokens }}
           EXTERNAL_LLM: ${{ inputs.llm_url != '' }}
+          ALLOW_GATED_MODELS: ${{ inputs.allow_gated_models }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
@@ -203,6 +211,7 @@ jobs:
             });
 
       - name: Start Modular MAX (Phase B)
+        id: max
         if: steps.preflight.outputs.skip_review != 'true' && inputs.llm_url == ''
         uses: martinvuyk/modular-open-code-review/actions/setup-modular-max@main
         env:
@@ -210,9 +219,9 @@ jobs:
         with:
           modular_version: ${{ inputs.modular_version }}
           python_version: '3.12'
-          model: ${{ steps.preflight.outputs.max_model }}
-          quantization: ${{ steps.preflight.outputs.max_quant }}
+          candidates_file: /tmp/ocr-candidates.json
           cache: ${{ inputs.cache_models }}
+          cache_key: ${{ hashFiles('.mocr/config/models.cpu.json') }}
 
       - name: Configure OCR for review
         if: steps.preflight.outputs.skip_review != 'true'
@@ -225,9 +234,12 @@ jobs:
           if [ -z "$LLM_URL" ]; then
             LLM_URL="http://127.0.0.1:8000/v1/chat/completions"
           fi
+          # Use the model that actually served (the chain may fall past the
+          # preferred one); fall back to the preflight label for external LLMs.
+          LLM_MODEL="${{ steps.max.outputs.served_model || steps.preflight.outputs.max_model }}"
           ocr config set llm.url "$LLM_URL"
           ocr config set llm.auth_token "local-max"
-          ocr config set llm.model "${{ steps.preflight.outputs.max_model }}"
+          ocr config set llm.model "$LLM_MODEL"
           ocr config set llm.use_anthropic false
           # Only set extra_body when provided; models without a thinking mode
           # (default Qwen2.5) must not receive a `thinking`/`chat_template_kwargs`
@@ -268,7 +280,7 @@ jobs:
             --from "$BASE_REF" \
             --to "$HEAD_SHA" \
             --format json \
-            --concurrency "${{ steps.preflight.outputs.ocr_concurrency }}" \
+            --concurrency "${{ steps.max.outputs.served_concurrency || steps.preflight.outputs.ocr_concurrency }}" \
             > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log
           rc=$?
           set -e
@@ -277,12 +289,24 @@ jobs:
           cat /tmp/ocr-stderr.log || true
           echo "ocr_exit_code=${rc}" >> "$GITHUB_OUTPUT"
 
+          # Dump the full result (minus inline comment bodies) so the run is
+          # debuggable: status, files reviewed, tool-call counts, warnings.
+          echo "OCR result (metadata):"
+          jq '{status, message, summary, tool_calls, comments: (.comments|length), warnings}' \
+            /tmp/ocr-result.json 2>/dev/null || cat /tmp/ocr-result.json || true
+
           # OCR emits token counts under .summary (json:"total_tokens" etc.).
           if [ -s /tmp/ocr-result.json ]; then
+            status=$(jq -r '.status // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            comments=$(jq -r '(.comments | length) // 0' /tmp/ocr-result.json 2>/dev/null || true)
+            warnings=$(jq -r '(.warnings | length) // 0' /tmp/ocr-result.json 2>/dev/null || true)
             total=$(jq -r '.summary.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
             input=$(jq -r '.summary.input_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
             output=$(jq -r '.summary.output_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
             files=$(jq -r '.summary.files_reviewed // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            echo "review_status=${status:-}" >> "$GITHUB_OUTPUT"
+            echo "comments_count=${comments:-0}" >> "$GITHUB_OUTPUT"
+            echo "warnings_count=${warnings:-0}" >> "$GITHUB_OUTPUT"
             echo "actual_total_tokens=${total:-}" >> "$GITHUB_OUTPUT"
             echo "actual_input_tokens=${input:-}" >> "$GITHUB_OUTPUT"
             echo "actual_output_tokens=${output:-}" >> "$GITHUB_OUTPUT"
@@ -300,10 +324,15 @@ jobs:
           ocr_result_path: /tmp/ocr-result.json
           ocr_stderr_path: /tmp/ocr-stderr.log
 
+      # Fail on a hard error (non-zero exit) OR on completed_with_errors, which
+      # means one or more files could not be reviewed even though OCR exits 0 —
+      # otherwise an incomplete review would masquerade as a green success.
       - name: Fail on review error
-        if: steps.review.outputs.ocr_exit_code != '' && steps.review.outputs.ocr_exit_code != '0'
+        if: >-
+          (steps.review.outputs.ocr_exit_code != '' && steps.review.outputs.ocr_exit_code != '0')
+          || steps.review.outputs.review_status == 'completed_with_errors'
         run: |
-          echo "::error::Failing job: Open Code Review exited ${{ steps.review.outputs.ocr_exit_code }}."
+          echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
           exit 1
 
       - name: Job summary
@@ -318,9 +347,12 @@ jobs:
             else
               echo "- Actual tokens: n/a (review skipped or failed)"
             fi
-            echo "- Model: ${{ steps.preflight.outputs.max_model }} (${{ steps.preflight.outputs.max_quant }})"
+            echo "- Preferred model: ${{ steps.preflight.outputs.max_model }} (${{ steps.preflight.outputs.max_quant }})"
+            echo "- Served model: ${{ steps.max.outputs.served_model || 'n/a (external or skipped)' }} (${{ steps.max.outputs.served_quant || 'n/a' }})"
             echo "- Estimated RAM: ~${{ steps.preflight.outputs.required_ram_gb }} GB needed / ${{ steps.preflight.outputs.free_ram_gb }} GB free"
             echo "- Concurrency: ${{ steps.preflight.outputs.ocr_concurrency }}"
             echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
+            echo "- Review status: ${{ steps.review.outputs.review_status || 'n/a' }}"
+            echo "- Comments: ${{ steps.review.outputs.comments_count || 'n/a' }} / Warnings: ${{ steps.review.outputs.warnings_count || 'n/a' }}"
             echo "- Review exit code: ${{ steps.review.outputs.ocr_exit_code || 'n/a' }}"
           } >> "$GITHUB_STEP_SUMMARY"

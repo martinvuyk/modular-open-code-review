@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Shared max warm-cache / max serve args for a Hugging Face model ID.
-# On CPU, safetensors models require --quantization-encoding float32 (bfloat16 is GPU-only).
+# Shared `max warm-cache` / `max serve` args for a model.
+#
+# Safetensors models run on CPU with --quantization-encoding float32 (bfloat16
+# is GPU-only). GGUF models pass a quantized encoding (q4_k/q6_k) plus a local
+# --weight-path; --model then only provides the architecture/config/tokenizer.
+# Args are NUL-delimited so paths with spaces survive `mapfile -d ''`.
 set -euo pipefail
 
-MODEL="${1:?usage: max-model-cli.sh <model_id> [quantization]}"
+MODEL="${1:?usage: max-model-cli.sh <model_id> [quantization] [weight_path]}"
 QUANT="${2:-float32}"
+WEIGHT_PATH="${3:-}"
 
 printf '%s\0' --devices=cpu --model "$MODEL"
 printf '%s\0' --quantization-encoding "$QUANT"
+if [[ -n "$WEIGHT_PATH" ]]; then
+  printf '%s\0' --weight-path "$WEIGHT_PATH"
+fi

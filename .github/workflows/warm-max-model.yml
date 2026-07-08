@@ -18,6 +18,11 @@ on:
         required: false
         type: string
         default: main
+      allow_gated_models:
+        description: Warm license-gated candidates (e.g. Llama 3.1) too
+        required: false
+        type: boolean
+        default: false
     secrets:
       HF_TOKEN:
         description: Hugging Face hub token (optional for ungated models)
@@ -73,20 +78,32 @@ jobs:
           path: |
             ~/.cache/huggingface
             ${{ runner.tool_cache }}/modular-max-cache
-          key: max-cpu-models-${{ inputs.modular_version }}-v2
+            ${{ runner.tool_cache }}/max-gguf
+          key: max-cpu-chain-${{ hashFiles('.mocr/config/models.cpu.json') }}-${{ inputs.modular_version }}-v3
           restore-keys: |
-            max-cpu-models-${{ inputs.modular_version }}-v2
+            max-cpu-chain-${{ hashFiles('.mocr/config/models.cpu.json') }}-
+            max-cpu-chain-
 
-      - name: Warm models from config
+      # Warm every candidate the review path could pick (serve + health-check +
+      # stop), so the shared cache holds each model's weights + compiled MEF.
+      - name: Warm the model chain
         env:
           HF_HOME: ~/.cache/huggingface
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MODULAR_MAX_CACHE_DIR: ${{ runner.tool_cache }}/modular-max-cache
-          MODULAR_VERSION: ${{ inputs.modular_version }}
+          GGUF_DIR: ${{ runner.tool_cache }}/max-gguf
+          ALLOW_GATED_MODELS: ${{ inputs.allow_gated_models }}
+          CANDIDATES_FILE: /tmp/ocr-candidates.json
+          STOP_AT_FIRST: 'false'
         run: |
           set -euo pipefail
-          mkdir -p "$MODULAR_MAX_CACHE_DIR"
-          bash .mocr/scripts/warm-max-models.sh .mocr/config/models.cpu.json
+          mkdir -p "$MODULAR_MAX_CACHE_DIR" "$GGUF_DIR"
+          # No diff here: feed a zero-token estimate so select-model builds the
+          # full RAM-fitting, gating-aware chain from the config.
+          printf 'ESTIMATED_TOKENS=0\nBUNDLE_COUNT=0\n' > /tmp/ocr-tokens.env
+          bash .mocr/scripts/select-model.sh /tmp/ocr-tokens.env \
+            .mocr/config/models.cpu.json "$CANDIDATES_FILE"
+          bash .mocr/scripts/serve-candidates.sh
 
       # success() only: never persist a half-populated cache from a failed
       # compile (that previously poisoned the key with an empty archive).
@@ -97,4 +114,5 @@ jobs:
           path: |
             ~/.cache/huggingface
             ${{ runner.tool_cache }}/modular-max-cache
-          key: max-cpu-models-${{ inputs.modular_version }}-v2
+            ${{ runner.tool_cache }}/max-gguf
+          key: max-cpu-chain-${{ hashFiles('.mocr/config/models.cpu.json') }}-${{ inputs.modular_version }}-v3
