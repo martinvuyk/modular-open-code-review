@@ -10,5 +10,5 @@ inputs:
     required: false
     default: /tmp/ocr-stderr.log
 runs:
-  using: node20
+  using: node24
   main: post-review.js

@@ -70,6 +70,7 @@ OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX run
 | `max_estimated_tokens` | `500000` | Skip review when preflight estimate exceeds this |
 | `post_comments` | `true` | Post GitHub review comments |
 | `llm_url` | `""` | External OpenAI-compatible API (skips local MAX) |
+| `llm_extra_body` | `""` | JSON merged into every LLM request. Only for thinking-capable models, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}`. Leave empty for Qwen2.5. |
 | `action_ref` | `main` | Ref of this repo for scripts |
 
 ### `max_estimated_tokens`

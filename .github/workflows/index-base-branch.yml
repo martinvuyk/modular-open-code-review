@@ -27,12 +27,12 @@ jobs:
     runs-on: ${{ inputs.runner }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.0
         with:
           fetch-depth: 0
 
       - name: Checkout action scripts
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v7.0.0
         with:
           repository: martinvuyk/modular-open-code-review
           ref: ${{ inputs.action_ref }}
@@ -45,7 +45,7 @@ jobs:
 
       - name: Restore codebase index cache
         id: cbm-cache
-        uses: actions/cache/restore@v4.2.2
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ runner.tool_cache }}/cbm-index
           key: cbm-index-${{ github.ref_name }}-${{ github.sha }}
@@ -65,7 +65,7 @@ jobs:
         run: bash .mocr/scripts/save-cbm-index.sh "${{ runner.tool_cache }}/cbm-index"
 
       - name: Save codebase index cache
-        uses: actions/cache/save@v4.2.2
+        uses: actions/cache/save@v6.1.0
         with:
           path: ${{ runner.tool_cache }}/cbm-index
           key: cbm-index-${{ github.ref_name }}-${{ github.sha }}
