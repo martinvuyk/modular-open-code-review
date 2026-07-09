@@ -18,10 +18,10 @@ import json
 import re
 import sys
 import uuid
+from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
 TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE
@@ -30,8 +30,23 @@ JSON_OBJECT_RE = re.compile(
     r"\{[^{}]*\"name\"\s*:\s*\"[^\"]+\"[^{}]*\}", re.DOTALL
 )
 
-UPSTREAM: str
+UPSTREAM = "http://127.0.0.1:8000"
 LOG_PREFIX = "[qwen25-max-tool-call-proxy]"
+
+HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+    }
+)
 
 
 def _make_tool_call(data: dict[str, Any]) -> dict[str, Any]:
@@ -132,6 +147,36 @@ def promote_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _upstream_target(path: str) -> tuple[str, int, str]:
+    parsed = urlparse(UPSTREAM)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    base = parsed.path.rstrip("/")
+    full_path = f"{base}{path}" if base else path
+    return host, port, full_path
+
+
+def _forward_upstream(
+    method: str, path: str, body: bytes, headers: dict[str, str]
+) -> tuple[int, list[tuple[str, str]], bytes]:
+    host, port, upstream_path = _upstream_target(path)
+    fwd = {
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in HOP_BY_HOP
+    }
+    conn = HTTPConnection(host, port, timeout=600)
+    try:
+        conn.request(method, upstream_path, body=body or None, headers=fwd)
+        resp = conn.getresponse()
+        raw = resp.read()
+        status = resp.status
+        resp_headers = list(resp.getheaders())
+        return status, resp_headers, raw
+    finally:
+        conn.close()
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -142,59 +187,58 @@ class ProxyHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         return self.rfile.read(length) if length else b""
 
-    def _forward(self, method: str, body: bytes = b"") -> None:
-        url = f"{UPSTREAM.rstrip('/')}{self.path}"
-        headers = {
-            k: v
-            for k, v in self.headers.items()
-            if k.lower() not in {"host", "content-length", "connection"}
-        }
-        req = Request(url, data=body or None, headers=headers, method=method)
+    def _client_headers(self) -> dict[str, str]:
+        return {k: v for k, v in self.headers.items()}
+
+    def _handle(self, method: str) -> None:
+        body = self._read_body() if method == "POST" else b""
         try:
-            with urlopen(req, timeout=600) as resp:
-                raw = resp.read()
-                status = resp.status
-                resp_headers = resp.headers
-        except HTTPError as exc:
-            raw = exc.read()
-            status = exc.code
-            resp_headers = exc.headers
-        except URLError as exc:
-            self.send_error(502, f"upstream error: {exc.reason}")
+            status, resp_headers, raw = _forward_upstream(
+                method, self.path, body, self._client_headers()
+            )
+        except (HTTPException, OSError) as exc:
+            sys.stderr.write(f"{LOG_PREFIX} upstream error: {exc}\n")
+            self.send_error(502, f"upstream error: {exc}")
             return
 
-        promoted = raw
-        ctype = resp_headers.get_content_type() if resp_headers else ""
+        out = raw
+        ctype = ""
+        for key, value in resp_headers:
+            if key.lower() == "content-type":
+                ctype = value.lower()
+                break
+
         if (
             method == "POST"
             and self.path.rstrip("/").endswith("/chat/completions")
-            and ctype == "application/json"
+            and "application/json" in ctype
             and raw
         ):
             try:
                 payload = json.loads(raw.decode("utf-8"))
                 req_payload = json.loads(body.decode("utf-8")) if body else {}
                 if not req_payload.get("stream") and isinstance(payload, dict):
-                    promoted = json.dumps(
+                    out = json.dumps(
                         promote_chat_completion(payload), ensure_ascii=False
                     ).encode("utf-8")
             except (json.JSONDecodeError, UnicodeDecodeError):
-                promoted = raw
+                out = raw
 
         self.send_response(status)
-        for key, value in resp_headers.items():
-            if key.lower() in {"transfer-encoding", "content-length", "connection"}:
+        for key, value in resp_headers:
+            if key.lower() in HOP_BY_HOP:
                 continue
             self.send_header(key, value)
-        self.send_header("Content-Length", str(len(promoted)))
+        self.send_header("Content-Length", str(len(out)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(promoted)
+        self.wfile.write(out)
 
     def do_GET(self) -> None:
-        self._forward("GET")
+        self._handle("GET")
 
     def do_POST(self) -> None:
-        self._forward("POST", self._read_body())
+        self._handle("POST")
 
 
 def main() -> None:
@@ -208,7 +252,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()
-    UPSTREAM = args.upstream
+    UPSTREAM = args.upstream.rstrip("/")
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
     sys.stderr.write(
         f"{LOG_PREFIX} listening on http://{args.host}:{args.port} -> {UPSTREAM}\n"
