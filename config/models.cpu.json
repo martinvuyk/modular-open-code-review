@@ -32,7 +32,7 @@
       "concurrency": 3,
       "license": "apache-2.0",
       "gated": false,
-      "note": "Best reviewer that loads on MAX 26.4 CPU (safetensors float32). q4_k GGUF is rejected by this MAX build."
+      "note": "Best reviewer that loads on MAX 26.4 CPU (safetensors float32)."
     },
     {
       "id": "Qwen/Qwen2.5-0.5B-Instruct",

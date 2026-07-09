@@ -73,7 +73,7 @@ OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX run
 | `llm_extra_body` | `""` | JSON merged into every LLM request. Only for thinking-capable models, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}`. Leave empty for Qwen2.5. |
 | `cache_models` | `true` | Cache the MAX venv + weights/compile artifacts (local MAX only; no effect with `llm_url`) |
 | `allow_gated_models` | `false` | Include license-gated candidates (e.g. Llama 3.1) in the local fallback chain. Default keeps only ungated Apache-2.0 models. |
-| `debug_review` | `false` | Log OCR session internals after review; upload `ocr-session` artifact; enable `OCR_ENABLE_TELEMETRY` + `OCR_CONTENT_LOGGING`. |
+| `debug_review` | `false` | Print OCR session trace in the job log and upload `ocr-session` JSONL artifact (`OCR_CONTENT_LOGGING` to stderr). |
 | `action_ref` | `main` | Ref of this repo for scripts |
 
 ### `max_estimated_tokens`
@@ -133,7 +133,7 @@ So the default chain is **`Qwen2.5-1.5B-Instruct` → `Qwen2.5-0.5B-Instruct`** 
 
 **Debugging OCR.** Set `debug_review: true` to enable telemetry content logging, print a session trace in the job log, and upload the JSONL audit as a workflow artifact (`ocr-session-<id>`). Locally: `ocr session list` / `ocr session show <id>`. On CI the audit lives only on the ephemeral runner unless uploaded — previous runs without `debug_review` left no retrievable artifact.
 
-**Tool-calling failure.** OCR only creates comments when the LLM calls tools (`code_comment`, `task_done`). If `tool_calls.total == 0` after a non-empty diff, the workflow fails (model/endpoint issue, not “clean code”).
+**Tool-calling.** Qwen2.5 on local MAX returns Hermes-style `<tool_call>…</tool_call>` in response text instead of OpenAI `tool_calls`. When the served model ID matches Qwen 2.5, [`scripts/qwen25-max-tool-call-proxy.py`](scripts/qwen25-max-tool-call-proxy.py) starts automatically on port 8001. External `llm_url` endpoints skip the proxy. If `tool_calls.total == 0` after a non-empty diff, the workflow fails.
 
 ## Secrets
 
