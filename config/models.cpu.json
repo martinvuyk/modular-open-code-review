@@ -26,22 +26,24 @@
   },
   "candidates": [
     {
-      "id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "id": "Qwen/Qwen3.5-2B",
       "quantization": "float32",
-      "params": 1543714304,
-      "concurrency": 3,
+      "params": 2274069824,
+      "concurrency": 2,
       "license": "apache-2.0",
       "gated": false,
-      "note": "Best reviewer that loads on MAX 26.4 CPU (safetensors float32). q4_k GGUF is rejected by this MAX build."
+      "tool_parser": "qwen3_5",
+      "note": "MAX-verified tool calling (~1.5B-class size, Qwen3_5ToolParser). ~14GB float32 on CPU; tight on 16GB runners."
     },
     {
-      "id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "id": "Qwen/Qwen3.5-0.8B",
       "quantization": "float32",
-      "params": 494032768,
+      "params": 873438784,
       "concurrency": 3,
       "license": "apache-2.0",
       "gated": false,
-      "note": "Last-resort safetensors float32; tiny and weak at tool-calling, but always fits."
+      "tool_parser": "qwen3_5",
+      "note": "MAX-verified tool calling (~0.5B-class size). ~7GB float32; last-resort fallback."
     }
   ]
 }

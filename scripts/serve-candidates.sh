@@ -45,6 +45,8 @@ for (( i = 0; i < count; i++ )); do
   conc=$(jq -r ".[$i].concurrency // 2" "$CANDIDATES_FILE")
   gguf_repo=$(jq -r ".[$i].gguf_repo // empty" "$CANDIDATES_FILE")
   gguf_file=$(jq -r ".[$i].gguf_file // empty" "$CANDIDATES_FILE")
+  tool_parser=$(jq -r ".[$i].tool_parser // empty" "$CANDIDATES_FILE")
+  reasoning_parser=$(jq -r ".[$i].reasoning_parser // empty" "$CANDIDATES_FILE")
 
   echo "::group::Candidate $((i + 1))/${count}: ${id} (${quant})"
 
@@ -58,7 +60,8 @@ for (( i = 0; i < count; i++ )); do
     echo "Using local weights: ${weight_path}"
   fi
 
-  mapfile -d '' -t args < <(bash "${SCRIPT_DIR}/max-model-cli.sh" "$id" "$quant" "$weight_path")
+  mapfile -d '' -t args < <(bash "${SCRIPT_DIR}/max-model-cli.sh" \
+    "$id" "$quant" "$weight_path" "$tool_parser" "$reasoning_parser")
 
   log="/tmp/max-serve-${i}.log"
   : > "$log"

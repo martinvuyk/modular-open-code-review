@@ -62,13 +62,12 @@ on:
         default: false
       llm_extra_body:
         description: >-
-          Optional JSON merged into every LLM request (OCR llm.extra_body).
-          Use for thinking-capable models, e.g.
-          '{"chat_template_kwargs": {"enable_thinking": false}}'.
-          Leave empty for models without a thinking mode (default Qwen2.5).
+          JSON merged into every LLM request (OCR llm.extra_body). Default
+          disables Qwen3.5 thinking mode for deterministic tool calling.
+          Set to empty for models without a thinking mode (e.g. Llama 3.1).
         required: false
         type: string
-        default: ''
+        default: '{"chat_template_kwargs": {"enable_thinking": false}}'
       debug_review:
         description: >-
           Log OCR session internals after review (LLM request/response summaries
@@ -248,9 +247,8 @@ jobs:
           ocr config set llm.auth_token "local-max"
           ocr config set llm.model "$LLM_MODEL"
           ocr config set llm.use_anthropic false
-          # Only set extra_body when provided; models without a thinking mode
-          # (default Qwen2.5) must not receive a `thinking`/`chat_template_kwargs`
-          # field. MAX also serves with --allow-extra-request-fields as a backstop.
+          # Only set extra_body when provided (default disables Qwen3.5 thinking).
+          # MAX also serves with --allow-extra-request-fields as a backstop.
           if [ -n "$LLM_EXTRA_BODY" ]; then
             ocr config set llm.extra_body "$LLM_EXTRA_BODY"
           fi
@@ -267,7 +265,8 @@ jobs:
           # setup command, so export CBM_CACHE_DIR here too — otherwise setup
           # falls back to ~/.cache/codebase-memory-mcp and can't find the index.
           CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
-          OCR_ENABLE_TELEMETRY: ${{ inputs.debug_review && '1' || '' }}
+          # Session JSONL + trace below are enough for debug; OCR_ENABLE_TELEMETRY
+          # prints extra JSON lines to stdout and corrupts `> /tmp/ocr-result.json`.
           OCR_CONTENT_LOGGING: ${{ inputs.debug_review && '1' || '' }}
         run: |
           set -euo pipefail
@@ -290,31 +289,33 @@ jobs:
             --to "$HEAD_SHA" \
             --format json \
             --concurrency "${{ steps.max.outputs.served_concurrency || steps.preflight.outputs.ocr_concurrency }}" \
-            > /tmp/ocr-result.json 2>/tmp/ocr-stderr.log
+            > /tmp/ocr-result-raw.json 2>/tmp/ocr-stderr.log
           rc=$?
           set -e
+
+          bash .mocr/scripts/normalize-ocr-result.sh \
+            /tmp/ocr-result-raw.json /tmp/ocr-result.json
 
           echo "OCR stderr:"
           cat /tmp/ocr-stderr.log || true
           echo "ocr_exit_code=${rc}" >> "$GITHUB_OUTPUT"
 
-          # Dump the full result (minus inline comment bodies) so the run is
-          # debuggable: status, files reviewed, tool-call counts, warnings.
+          # Dump the review result (telemetry may have been stripped from raw stdout).
           echo "OCR result (metadata):"
           jq '{status, message, session_id, summary, tool_calls, comments: (.comments|length), warnings}' \
             /tmp/ocr-result.json 2>/dev/null || cat /tmp/ocr-result.json || true
 
           # OCR emits token counts under .summary (json:"total_tokens" etc.).
           if [ -s /tmp/ocr-result.json ]; then
-            status=$(jq -r '.status // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            session_id=$(jq -r '.session_id // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            comments=$(jq -r '(.comments | length) // 0' /tmp/ocr-result.json 2>/dev/null || true)
-            warnings=$(jq -r '(.warnings | length) // 0' /tmp/ocr-result.json 2>/dev/null || true)
-            tool_total=$(jq -r '.tool_calls.total // 0' /tmp/ocr-result.json 2>/dev/null || true)
-            total=$(jq -r '.summary.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            input=$(jq -r '.summary.input_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            output=$(jq -r '.summary.output_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
-            files=$(jq -r '.summary.files_reviewed // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            status=$(jq -r '.status // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            session_id=$(jq -r '.session_id // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            comments=$(jq -r '(.comments | length) // 0' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            warnings=$(jq -r '(.warnings | length) // 0' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            tool_total=$(jq -r '.tool_calls.total // 0' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            total=$(jq -r '.summary.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            input=$(jq -r '.summary.input_tokens // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            output=$(jq -r '.summary.output_tokens // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            files=$(jq -r '.summary.files_reviewed // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
             echo "review_status=${status:-}" >> "$GITHUB_OUTPUT"
             echo "ocr_session_id=${session_id:-}" >> "$GITHUB_OUTPUT"
             echo "comments_count=${comments:-0}" >> "$GITHUB_OUTPUT"
@@ -328,7 +329,7 @@ jobs:
 
           # OCR persists every LLM request/response to ~/.opencodereview/sessions/
           # as JSONL. Surface a compact trace so we can tell whether the model
-          # actually called tools (code_comment, task_done) or just returned text.
+          # returned structured tool_calls or only plain-text tool syntax.
           if [ -n "${session_id:-}" ]; then
             jsonl=$(find "$HOME/.opencodereview/sessions" -name "${session_id}.jsonl" 2>/dev/null | head -1 || true)
             if [ -n "$jsonl" ] && [ -f "$jsonl" ]; then
@@ -391,7 +392,7 @@ jobs:
           )
         run: |
           if [ "${{ steps.review.outputs.tool_calls_total }}" = "0" ]; then
-            echo "::error::Failing job: OCR completed but the LLM made zero tool calls (model likely cannot use OCR's tool-calling protocol on this endpoint). See OCR session trace / artifact."
+            echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls (check MAX --tool-parser for this model; plain-text <tool_call> in content is not enough). See OCR session trace / artifact."
           else
             echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
           fi
