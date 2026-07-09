@@ -33,7 +33,9 @@ if [[ "$count" -eq 0 ]]; then
 fi
 
 set_output() {
-  [[ -n "${GITHUB_OUTPUT:-}" ]] && echo "$1=$2" >> "$GITHUB_OUTPUT" || true
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    echo "$1=$2" >> "$GITHUB_OUTPUT"
+  fi
 }
 
 warmed=0

@@ -149,7 +149,6 @@ for (( i = 0; i < num; i++ )); do
   quant=$(jq -r ".candidates[$i].quantization" "$CONFIG")
   gated=$(jq -r ".candidates[$i].gated // false" "$CONFIG")
   declared=$(jq -r ".candidates[$i].params // empty" "$CONFIG")
-  conc=$(jq -r ".candidates[$i].concurrency // 2" "$CONFIG")
 
   if [[ "$gated" == "true" && "$ALLOW_GATED_MODELS" != "true" ]]; then
     echo "Skipping gated candidate ${id} (set allow_gated_models to enable)." >&2
