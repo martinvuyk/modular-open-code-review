@@ -26,44 +26,13 @@
   },
   "candidates": [
     {
-      "id": "Qwen/Qwen2.5-Coder-7B-Instruct",
-      "quantization": "q4_k",
-      "gguf_repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
-      "gguf_file": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-      "params": 7615616512,
-      "concurrency": 2,
-      "license": "apache-2.0",
-      "gated": false,
-      "note": "Code-specialized 7B, best reviewer that fits a 16GB CPU runner."
-    },
-    {
-      "id": "Qwen/Qwen2.5-7B-Instruct",
-      "quantization": "q4_k",
-      "gguf_repo": "Qwen/Qwen2.5-7B-Instruct-GGUF",
-      "gguf_file": "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
-      "params": 7615616512,
-      "concurrency": 2,
-      "license": "apache-2.0",
-      "gated": false,
-      "note": "General 7B; GGUF is sharded, MAX may not load it \u2014 falls through if so."
-    },
-    {
-      "id": "modularai/Llama-3.1-8B-Instruct-GGUF",
-      "quantization": "q4_k",
-      "params": 8030261248,
-      "concurrency": 2,
-      "license": "llama-3.1-community",
-      "gated": true,
-      "note": "Turnkey MAX GGUF; strong but non-Apache license \u2014 opt in with allow_gated_models."
-    },
-    {
       "id": "Qwen/Qwen2.5-1.5B-Instruct",
       "quantization": "float32",
       "params": 1543714304,
       "concurrency": 3,
       "license": "apache-2.0",
       "gated": false,
-      "note": "Safetensors float32, guaranteed to load on CPU; weak reviewer."
+      "note": "Best reviewer that loads on MAX 26.4 CPU (safetensors float32). q4_k GGUF is rejected by this MAX build."
     },
     {
       "id": "Qwen/Qwen2.5-0.5B-Instruct",
@@ -72,7 +41,7 @@
       "concurrency": 3,
       "license": "apache-2.0",
       "gated": false,
-      "note": "Last-resort safetensors float32; tiny and unreliable, but always fits."
+      "note": "Last-resort safetensors float32; tiny and weak at tool-calling, but always fits."
     }
   ]
 }

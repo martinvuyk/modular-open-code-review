@@ -69,6 +69,13 @@ on:
         required: false
         type: string
         default: ''
+      debug_review:
+        description: >-
+          Log OCR session internals after review (LLM request/response summaries
+          from ~/.opencodereview/sessions). Enables OCR telemetry content logging.
+        required: false
+        type: boolean
+        default: false
     secrets:
       HF_TOKEN:
         description: Hugging Face hub token for gated models and Hub downloads
@@ -260,6 +267,8 @@ jobs:
           # setup command, so export CBM_CACHE_DIR here too — otherwise setup
           # falls back to ~/.cache/codebase-memory-mcp and can't find the index.
           CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
+          OCR_ENABLE_TELEMETRY: ${{ inputs.debug_review && '1' || '' }}
+          OCR_CONTENT_LOGGING: ${{ inputs.debug_review && '1' || '' }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
@@ -292,25 +301,57 @@ jobs:
           # Dump the full result (minus inline comment bodies) so the run is
           # debuggable: status, files reviewed, tool-call counts, warnings.
           echo "OCR result (metadata):"
-          jq '{status, message, summary, tool_calls, comments: (.comments|length), warnings}' \
+          jq '{status, message, session_id, summary, tool_calls, comments: (.comments|length), warnings}' \
             /tmp/ocr-result.json 2>/dev/null || cat /tmp/ocr-result.json || true
 
           # OCR emits token counts under .summary (json:"total_tokens" etc.).
           if [ -s /tmp/ocr-result.json ]; then
             status=$(jq -r '.status // empty' /tmp/ocr-result.json 2>/dev/null || true)
+            session_id=$(jq -r '.session_id // empty' /tmp/ocr-result.json 2>/dev/null || true)
             comments=$(jq -r '(.comments | length) // 0' /tmp/ocr-result.json 2>/dev/null || true)
             warnings=$(jq -r '(.warnings | length) // 0' /tmp/ocr-result.json 2>/dev/null || true)
+            tool_total=$(jq -r '.tool_calls.total // 0' /tmp/ocr-result.json 2>/dev/null || true)
             total=$(jq -r '.summary.total_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
             input=$(jq -r '.summary.input_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
             output=$(jq -r '.summary.output_tokens // empty' /tmp/ocr-result.json 2>/dev/null || true)
             files=$(jq -r '.summary.files_reviewed // empty' /tmp/ocr-result.json 2>/dev/null || true)
             echo "review_status=${status:-}" >> "$GITHUB_OUTPUT"
+            echo "ocr_session_id=${session_id:-}" >> "$GITHUB_OUTPUT"
             echo "comments_count=${comments:-0}" >> "$GITHUB_OUTPUT"
             echo "warnings_count=${warnings:-0}" >> "$GITHUB_OUTPUT"
+            echo "tool_calls_total=${tool_total:-0}" >> "$GITHUB_OUTPUT"
             echo "actual_total_tokens=${total:-}" >> "$GITHUB_OUTPUT"
             echo "actual_input_tokens=${input:-}" >> "$GITHUB_OUTPUT"
             echo "actual_output_tokens=${output:-}" >> "$GITHUB_OUTPUT"
             echo "files_reviewed=${files:-}" >> "$GITHUB_OUTPUT"
+          fi
+
+          # OCR persists every LLM request/response to ~/.opencodereview/sessions/
+          # as JSONL. Surface a compact trace so we can tell whether the model
+          # actually called tools (code_comment, task_done) or just returned text.
+          if [ -n "${session_id:-}" ]; then
+            jsonl=$(find "$HOME/.opencodereview/sessions" -name "${session_id}.jsonl" 2>/dev/null | head -1 || true)
+            if [ -n "$jsonl" ] && [ -f "$jsonl" ]; then
+              echo "OCR session trace (${jsonl}):"
+              echo "--- review items ---"
+              jq -c 'select(.type|startswith("review_item")) | {type, filePath, error, comments: ((.comments // []) | length)}' "$jsonl" 2>/dev/null || true
+              echo "--- LLM responses (content preview + tool_calls count) ---"
+              preview_len=400
+              if [ "${{ inputs.debug_review }}" = "true" ]; then preview_len=4000; fi
+              jq -c --argjson n "$preview_len" \
+                'select(.type=="llm_response" or .type=="llm_error") | {
+                  type, taskType,
+                  content: ((.content // .error // "") | tostring | .[0:$n]),
+                  tool_calls: ((.tool_calls // []) | length),
+                  usage: .usage
+                }' "$jsonl" 2>/dev/null || true
+              echo "--- tool executions ---"
+              jq -c 'select(.type=="tool_call") | {tool_name, ok, result: ((.result // "") | tostring | .[0:200])}' "$jsonl" 2>/dev/null || true
+              cp "$jsonl" /tmp/ocr-session.jsonl
+              echo "ocr_session_path=/tmp/ocr-session.jsonl" >> "$GITHUB_OUTPUT"
+            else
+              echo "OCR session file not found for session_id=${session_id}"
+            fi
           fi
 
           if [ "$rc" -ne 0 ]; then
@@ -324,6 +365,16 @@ jobs:
           ocr_result_path: /tmp/ocr-result.json
           ocr_stderr_path: /tmp/ocr-stderr.log
 
+      - name: Upload OCR session audit
+        if: >-
+          inputs.debug_review
+          && steps.review.outputs.ocr_session_path != ''
+        uses: actions/upload-artifact@v4.6.0
+        with:
+          name: ocr-session-${{ steps.review.outputs.ocr_session_id || github.run_id }}
+          path: /tmp/ocr-session.jsonl
+          if-no-files-found: ignore
+
       # Fail on a hard error (non-zero exit) OR on completed_with_errors, which
       # means one or more files could not be reviewed even though OCR exits 0 —
       # otherwise an incomplete review would masquerade as a green success.
@@ -331,8 +382,19 @@ jobs:
         if: >-
           (steps.review.outputs.ocr_exit_code != '' && steps.review.outputs.ocr_exit_code != '0')
           || steps.review.outputs.review_status == 'completed_with_errors'
+          || (
+            steps.preflight.outputs.skip_review != 'true'
+            && inputs.llm_url == ''
+            && steps.review.outputs.tool_calls_total == '0'
+            && steps.review.outputs.files_reviewed != ''
+            && steps.review.outputs.files_reviewed != '0'
+          )
         run: |
-          echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
+          if [ "${{ steps.review.outputs.tool_calls_total }}" = "0" ]; then
+            echo "::error::Failing job: OCR completed but the LLM made zero tool calls (model likely cannot use OCR's tool-calling protocol on this endpoint). See OCR session trace / artifact."
+          else
+            echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
+          fi
           exit 1
 
       - name: Job summary
@@ -354,5 +416,7 @@ jobs:
             echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
             echo "- Review status: ${{ steps.review.outputs.review_status || 'n/a' }}"
             echo "- Comments: ${{ steps.review.outputs.comments_count || 'n/a' }} / Warnings: ${{ steps.review.outputs.warnings_count || 'n/a' }}"
+            echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }}"
+            echo "- OCR session: ${{ steps.review.outputs.ocr_session_id || 'n/a' }}"
             echo "- Review exit code: ${{ steps.review.outputs.ocr_exit_code || 'n/a' }}"
           } >> "$GITHUB_STEP_SUMMARY"
