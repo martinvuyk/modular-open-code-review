@@ -14,8 +14,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=is-qwen25-max-model.sh
-source "${SCRIPT_DIR}/is-qwen25-max-model.sh"
 CANDIDATES_FILE="${CANDIDATES_FILE:?CANDIDATES_FILE required}"
 MAX_PORT="${MAX_PORT:-8000}"
 SERVE_TIMEOUT="${SERVE_TIMEOUT:-1800}"
@@ -83,7 +81,7 @@ for (( i = 0; i < count; i++ )); do
       set_output served_quant "$quant"
       set_output served_concurrency "$conc"
       set_output served_ok "true"
-      if is_qwen25_max_model "$id"; then
+      if bash "${SCRIPT_DIR}/is-qwen25-max-model.sh" "$id"; then
         echo "Qwen 2.5 on MAX: starting Hermes tool-call proxy."
         bash "${SCRIPT_DIR}/start-qwen25-max-tool-call-proxy.sh"
       else
