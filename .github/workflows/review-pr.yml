@@ -62,12 +62,13 @@ on:
         default: false
       llm_extra_body:
         description: >-
-          JSON merged into every LLM request (OCR llm.extra_body). Default
-          disables Qwen3.5 thinking mode for deterministic tool calling.
-          Set to empty for models without a thinking mode (e.g. Llama 3.1).
+          Optional JSON merged into every LLM request (OCR llm.extra_body).
+          Use for thinking-capable models, e.g.
+          '{"chat_template_kwargs": {"enable_thinking": false}}'.
+          Leave empty for models without a thinking mode (default Qwen2.5).
         required: false
         type: string
-        default: '{"chat_template_kwargs": {"enable_thinking": false}}'
+        default: ''
       debug_review:
         description: >-
           Log OCR session internals after review (LLM request/response summaries
@@ -238,7 +239,9 @@ jobs:
           set -euo pipefail
           LLM_URL="${{ inputs.llm_url }}"
           if [ -z "$LLM_URL" ]; then
-            LLM_URL="http://127.0.0.1:8000/v1/chat/completions"
+            LLM_PORT="${{ steps.max.outputs.llm_port }}"
+            if [ -z "$LLM_PORT" ]; then LLM_PORT=8000; fi
+            LLM_URL="http://127.0.0.1:${LLM_PORT}/v1/chat/completions"
           fi
           # Use the model that actually served (the chain may fall past the
           # preferred one); fall back to the preflight label for external LLMs.
@@ -247,8 +250,8 @@ jobs:
           ocr config set llm.auth_token "local-max"
           ocr config set llm.model "$LLM_MODEL"
           ocr config set llm.use_anthropic false
-          # Only set extra_body when provided (default disables Qwen3.5 thinking).
-          # MAX also serves with --allow-extra-request-fields as a backstop.
+          # Only set extra_body when provided. MAX serves with
+          # --allow-extra-request-fields as a backstop for unknown fields.
           if [ -n "$LLM_EXTRA_BODY" ]; then
             ocr config set llm.extra_body "$LLM_EXTRA_BODY"
           fi
@@ -392,7 +395,7 @@ jobs:
           )
         run: |
           if [ "${{ steps.review.outputs.tool_calls_total }}" = "0" ]; then
-            echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls (check MAX --tool-parser for this model; plain-text <tool_call> in content is not enough). See OCR session trace / artifact."
+            echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls. For Qwen2.5 on local MAX, check that the Qwen2.5 tool-call proxy started (job summary). See OCR session trace / artifact."
           else
             echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
           fi
@@ -418,6 +421,7 @@ jobs:
             echo "- Review status: ${{ steps.review.outputs.review_status || 'n/a' }}"
             echo "- Comments: ${{ steps.review.outputs.comments_count || 'n/a' }} / Warnings: ${{ steps.review.outputs.warnings_count || 'n/a' }}"
             echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }}"
+            echo "- Qwen2.5 MAX tool-call proxy: ${{ steps.max.outputs.qwen25_max_tool_call_proxy || 'n/a' }}"
             echo "- OCR session: ${{ steps.review.outputs.ocr_session_id || 'n/a' }}"
             echo "- Review exit code: ${{ steps.review.outputs.ocr_exit_code || 'n/a' }}"
           } >> "$GITHUB_STEP_SUMMARY"

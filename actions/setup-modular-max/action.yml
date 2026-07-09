@@ -47,6 +47,12 @@ outputs:
   served_concurrency:
     description: Suggested OCR concurrency for the served model
     value: ${{ steps.serve.outputs.served_concurrency }}
+  llm_port:
+    description: Port OCR should call (Qwen2.5 proxy port when active, else MAX port)
+    value: ${{ steps.serve.outputs.llm_port }}
+  qwen25_max_tool_call_proxy:
+    description: Whether the Qwen2.5 MAX Hermes tool-call proxy is in front of MAX
+    value: ${{ steps.serve.outputs.qwen25_max_tool_call_proxy }}
 runs:
   using: composite
   steps:

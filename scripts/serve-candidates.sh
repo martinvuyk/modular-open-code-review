@@ -14,6 +14,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=is-qwen25-max-model.sh
+source "${SCRIPT_DIR}/is-qwen25-max-model.sh"
 CANDIDATES_FILE="${CANDIDATES_FILE:?CANDIDATES_FILE required}"
 MAX_PORT="${MAX_PORT:-8000}"
 SERVE_TIMEOUT="${SERVE_TIMEOUT:-1800}"
@@ -81,6 +83,13 @@ for (( i = 0; i < count; i++ )); do
       set_output served_quant "$quant"
       set_output served_concurrency "$conc"
       set_output served_ok "true"
+      if is_qwen25_max_model "$id"; then
+        echo "Qwen 2.5 on MAX: starting Hermes tool-call proxy."
+        bash "${SCRIPT_DIR}/start-qwen25-max-tool-call-proxy.sh"
+      else
+        set_output llm_port "$MAX_PORT"
+        set_output qwen25_max_tool_call_proxy "false"
+      fi
       echo "::endgroup::"
       echo "Serving ${id} for review."
       exit 0
@@ -93,8 +102,9 @@ for (( i = 0; i < count; i++ )); do
     continue
   fi
 
+  echo "::error title=MAX serve failed::${id} did not become ready (see log tail below)."
   echo "Candidate ${id} failed to become ready; tail of log:"
-  tail -n 60 "$log" || true
+  tail -n 120 "$log" || true
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   sleep 3

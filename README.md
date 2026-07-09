@@ -70,7 +70,7 @@ OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX run
 | `max_estimated_tokens` | `500000` | Skip review when preflight estimate exceeds this |
 | `post_comments` | `true` | Post GitHub review comments |
 | `llm_url` | `""` | External OpenAI-compatible API (skips local MAX, its caching, and RAM gating). Set `model_override` to name the external model. |
-| `llm_extra_body` | `{"chat_template_kwargs": {"enable_thinking": false}}` | JSON merged into every LLM request. Default disables Qwen3.5 thinking for deterministic tool calling. Set to `""` for models without a thinking mode (e.g. Llama 3.1). |
+| `llm_extra_body` | `""` | JSON merged into every LLM request. Only for thinking-capable models, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}`. Leave empty for Qwen2.5. |
 | `cache_models` | `true` | Cache the MAX venv + weights/compile artifacts (local MAX only; no effect with `llm_url`) |
 | `allow_gated_models` | `false` | Include license-gated candidates (e.g. Llama 3.1) in the local fallback chain. Default keeps only ungated Apache-2.0 models. |
 | `debug_review` | `false` | Print OCR session trace in the job log and upload `ocr-session` JSONL artifact (`OCR_CONTENT_LOGGING` to stderr). |
@@ -95,7 +95,7 @@ jobs:
   review:
     uses: martinvuyk/modular-open-code-review/.github/workflows/review-pr.yml@main
     with:
-      model_override: Qwen/Qwen3.5-2B
+      model_override: Qwen/Qwen2.5-1.5B-Instruct
       max_estimated_tokens: '300000'
     secrets: inherit
 ```
@@ -125,15 +125,15 @@ The local CPU path uses an **ordered fallback chain** (see `candidates` in [`con
 quantization_encoding of 'q4_k' not supported by MAX engine
 ```
 
-So the default chain is **`Qwen3.5-2B` → `Qwen3.5-0.8B`** (both `float32`, with `--tool-parser qwen3_5`). These are the same size class as the old Qwen2.5 1.5B/0.5B pair, but Qwen3.5 is on [MAX's verified function-calling list](https://docs.modular.com/max/serve/function-calling/); Qwen2.5 has no tool parser in MAX and emits Hermes-style `<tool_call>` text that OCR cannot use. A 7B model at `float32` needs ~28 GB and OOMs on 16 GB runners. For strong reviews use `llm_url` (hosted model) or a larger runner.
+So the default chain is **`Qwen2.5-1.5B-Instruct` → `Qwen2.5-0.5B-Instruct`** (both `float32`). A 7B model at `float32` needs ~28 GB and OOMs on 16 GB runners. For strong reviews use `llm_url` (hosted model) or a larger runner.
 
-**Latency.** CPU `float32` 2B reviews take minutes per file. The warm workflow on `main` pre-compiles models so PR jobs restore cache instead of cold-starting.
+**Latency.** CPU `float32` 1.5B reviews take minutes per file. The warm workflow on `main` pre-compiles models so PR jobs restore cache instead of cold-starting.
 
 **RAM pre-flight.** Peak RAM is estimated from parameter count × encoding bytes + safety factor (see `ram_estimate` in config). Candidates that exceed `MemAvailable` are dropped.
 
 **Debugging OCR.** Set `debug_review: true` to enable telemetry content logging, print a session trace in the job log, and upload the JSONL audit as a workflow artifact (`ocr-session-<id>`). Locally: `ocr session list` / `ocr session show <id>`. On CI the audit lives only on the ephemeral runner unless uploaded — previous runs without `debug_review` left no retrievable artifact.
 
-**Tool-calling failure.** OCR only creates comments when the LLM returns structured OpenAI `tool_calls` (e.g. `code_comment`). If the model writes `<tool_call>…</tool_call>` as plain text instead, `tool_calls.total` stays 0 and the workflow fails — that usually means MAX needs the right `--tool-parser` for the architecture, not a “weak” model. The default Qwen3.5 chain sets `tool_parser: qwen3_5` in config.
+**Tool-calling.** Qwen2.5 on local MAX returns Hermes-style `<tool_call>…</tool_call>` in response text instead of OpenAI `tool_calls`. When the served model ID matches Qwen 2.5, [`scripts/qwen25-max-tool-call-proxy.py`](scripts/qwen25-max-tool-call-proxy.py) starts automatically on port 8001. External `llm_url` endpoints skip the proxy. If `tool_calls.total == 0` after a non-empty diff, the workflow fails.
 
 ## Secrets
 
