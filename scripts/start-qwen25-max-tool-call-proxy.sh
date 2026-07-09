@@ -39,7 +39,9 @@ while (( SECONDS < deadline )); do
     tail -n 40 "$LOG" >&2 || true
     exit 1
   fi
-  if curl -fsS "http://127.0.0.1:${LLM_PROXY_PORT}/v1/health" >/dev/null 2>&1; then
+  # Require JSON from /v1/health — MAX metrics on :8001 returns HTTP 200 Prometheus text.
+  if health_body=$(curl -fsS --max-time 5 "http://127.0.0.1:${LLM_PROXY_PORT}/v1/health" 2>/dev/null) \
+    && [[ "$health_body" == \{* ]]; then
     echo "Qwen2.5 MAX tool-call proxy ready on port ${LLM_PROXY_PORT} (pid ${proxy_pid})."
     set_output llm_port "$LLM_PROXY_PORT"
     set_output qwen25_max_tool_call_proxy "true"

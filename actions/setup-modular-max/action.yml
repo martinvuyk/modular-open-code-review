@@ -138,6 +138,7 @@ runs:
         MAX_PORT: ${{ inputs.port }}
         SERVE_TIMEOUT: ${{ inputs.serve_timeout }}
         STOP_AT_FIRST: 'true'
+        MAX_SERVE_METRICS_ENDPOINT_PORT: '9090'
       run: |
         set -euo pipefail
         mkdir -p "$MODULAR_MAX_CACHE_DIR" "$GGUF_DIR"

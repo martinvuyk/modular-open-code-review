@@ -19,6 +19,9 @@ MAX_PORT="${MAX_PORT:-8000}"
 SERVE_TIMEOUT="${SERVE_TIMEOUT:-1800}"
 GGUF_DIR="${GGUF_DIR:-${MODULAR_MAX_CACHE_DIR:-/tmp}/gguf}"
 STOP_AT_FIRST="${STOP_AT_FIRST:-true}"
+# MAX defaults metrics to port 8001 (API port + 1), which is where the Qwen2.5
+# tool-call proxy listens. Move metrics so the proxy can bind.
+export MAX_SERVE_METRICS_ENDPOINT_PORT="${MAX_SERVE_METRICS_ENDPOINT_PORT:-9090}"
 
 mkdir -p "$GGUF_DIR"
 
