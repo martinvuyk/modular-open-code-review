@@ -42,7 +42,7 @@ while (( SECONDS < deadline )); do
   fi
   # Proxy-native health (MAX /v1/health is HTTP 200 but not JSON).
   if health_body=$(curl -fsS --max-time 5 "$PROXY_HEALTH_URL" 2>/dev/null) \
-    && [[ "$health_body" == *'"proxy":"qwen25-max-tool-call"'* ]]; then
+    && jq -e '.proxy == "qwen25-max-tool-call"' <<<"$health_body" >/dev/null 2>&1; then
     echo "Qwen2.5 MAX tool-call proxy ready on port ${LLM_PROXY_PORT} (pid ${proxy_pid})."
     set_output llm_port "$LLM_PROXY_PORT"
     set_output qwen25_max_tool_call_proxy "true"
