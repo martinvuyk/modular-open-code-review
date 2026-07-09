@@ -133,7 +133,7 @@ So the default chain is **`Qwen2.5-1.5B-Instruct` → `Qwen2.5-0.5B-Instruct`** 
 
 **Debugging OCR.** Set `debug_review: true` to enable telemetry content logging, print a session trace in the job log, and upload the JSONL audit as a workflow artifact (`ocr-session-<id>`). Locally: `ocr session list` / `ocr session show <id>`. On CI the audit lives only on the ephemeral runner unless uploaded — previous runs without `debug_review` left no retrievable artifact.
 
-**Tool-calling.** Qwen2.5 on local MAX returns Hermes-style `<tool_call>…</tool_call>` in response text instead of OpenAI `tool_calls`. When the served model ID matches Qwen 2.5, [`scripts/qwen25-max-tool-call-proxy.py`](scripts/qwen25-max-tool-call-proxy.py) starts automatically on port 8001. External `llm_url` endpoints skip the proxy. If `tool_calls.total == 0` after a non-empty diff, the workflow fails.
+**Tool-calling.** Qwen2.5 on local MAX returns Hermes-style `<tool_call>…</tool_call>` in response text instead of OpenAI `tool_calls`. When the served model ID matches Qwen 2.5, [`scripts/qwen25-max-tool-call-proxy.py`](scripts/qwen25-max-tool-call-proxy.py) starts automatically on port 8001 (MAX API stays on 8000; Prometheus metrics move to 9090 so they do not collide). External `llm_url` endpoints skip the proxy. If `tool_calls.total == 0` after a non-empty diff, the workflow fails.
 
 ## Secrets
 
