@@ -165,6 +165,11 @@ def _forward_upstream(
         for k, v in headers.items()
         if k.lower() not in HOP_BY_HOP
     }
+    # Always target the upstream MAX listener, never the client-facing proxy port.
+    fwd["Host"] = f"{host}:{port}" if port not in (80, 443) else host
+    if method == "POST" and upstream_path.rstrip("/").endswith("/chat/completions"):
+        fwd["Accept"] = "application/json"
+        fwd["Expect"] = ""
     conn = HTTPConnection(host, port, timeout=600)
     try:
         conn.request(method, upstream_path, body=body or None, headers=fwd)
@@ -191,10 +196,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return {k: v for k, v in self.headers.items()}
 
     def _handle(self, method: str) -> None:
+        path = urlparse(self.path).path or self.path
+        if not path.startswith("/v1/"):
+            self.send_error(404, f"unsupported path: {path}")
+            return
+
         body = self._read_body() if method == "POST" else b""
         try:
             status, resp_headers, raw = _forward_upstream(
-                method, self.path, body, self._client_headers()
+                method, path, body, self._client_headers()
             )
         except (HTTPException, OSError) as exc:
             sys.stderr.write(f"{LOG_PREFIX} upstream error: {exc}\n")
@@ -210,7 +220,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if (
             method == "POST"
-            and self.path.rstrip("/").endswith("/chat/completions")
+            and path.rstrip("/").endswith("/chat/completions")
             and "application/json" in ctype
             and raw
         ):

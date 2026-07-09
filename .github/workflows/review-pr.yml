@@ -270,7 +270,13 @@ jobs:
           ocr config set mcp_servers.codebase-memory.setup 'codebase-memory-mcp cli list_projects'
           ocr config set mcp_servers.codebase-memory.env "[\"CBM_CACHE_DIR=${CBM_CACHE_DIR}\",\"CBM_LOG_LEVEL=info\"]"
           if [ -z "${{ inputs.llm_url }}" ]; then
-            bash .mocr/scripts/verify-llm-endpoint.sh "$LLM_URL" "$LLM_MODEL" "local-max"
+            MAX_SERVE_PORT=8000
+            # MAX always listens here; the Qwen2.5 proxy (if any) is on llm_port.
+            bash .mocr/scripts/verify-llm-endpoint.sh \
+              "http://127.0.0.1:${MAX_SERVE_PORT}/v1" "$LLM_MODEL" "local-max"
+            if [ "$LLM_PORT" != "$MAX_SERVE_PORT" ]; then
+              bash .mocr/scripts/verify-llm-endpoint.sh "$LLM_URL" "$LLM_MODEL" "local-max"
+            fi
           fi
 
       - name: Run Open Code Review
