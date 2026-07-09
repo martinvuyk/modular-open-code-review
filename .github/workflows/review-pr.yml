@@ -230,8 +230,19 @@ jobs:
           cache: ${{ inputs.cache_models }}
           cache_key: ${{ hashFiles('.mocr/config/models.cpu.json') }}
 
+      - name: Fail when local MAX did not start
+        if: >-
+          steps.preflight.outputs.skip_review != 'true'
+          && inputs.llm_url == ''
+          && steps.max.outcome != 'success'
+        run: |
+          echo "::error::Local MAX setup failed; cannot run Open Code Review."
+          exit 1
+
       - name: Configure OCR for review
-        if: steps.preflight.outputs.skip_review != 'true'
+        if: >-
+          steps.preflight.outputs.skip_review != 'true'
+          && (inputs.llm_url != '' || steps.max.outcome == 'success')
         env:
           CBM_CACHE_DIR: ${{ runner.tool_cache }}/codebase-memory-mcp
           LLM_EXTRA_BODY: ${{ inputs.llm_extra_body }}
@@ -241,27 +252,32 @@ jobs:
           if [ -z "$LLM_URL" ]; then
             LLM_PORT="${{ steps.max.outputs.llm_port }}"
             if [ -z "$LLM_PORT" ]; then LLM_PORT=8000; fi
-            LLM_URL="http://127.0.0.1:${LLM_PORT}/v1/chat/completions"
+            # OpenAI-compatible base; OCR appends /chat/completions.
+            LLM_URL="http://127.0.0.1:${LLM_PORT}/v1"
           fi
-          # Use the model that actually served (the chain may fall past the
-          # preferred one); fall back to the preflight label for external LLMs.
           LLM_MODEL="${{ steps.max.outputs.served_model || steps.preflight.outputs.max_model }}"
+          echo "OCR LLM URL: ${LLM_URL}"
+          echo "OCR LLM model: ${LLM_MODEL}"
+          echo "Qwen2.5 MAX tool-call proxy: ${{ steps.max.outputs.qwen25_max_tool_call_proxy || 'false' }}"
           ocr config set llm.url "$LLM_URL"
           ocr config set llm.auth_token "local-max"
           ocr config set llm.model "$LLM_MODEL"
           ocr config set llm.use_anthropic false
-          # Only set extra_body when provided. MAX serves with
-          # --allow-extra-request-fields as a backstop for unknown fields.
-          if [ -n "$LLM_EXTRA_BODY" ]; then
+          if [ -n "${LLM_EXTRA_BODY:-}" ]; then
             ocr config set llm.extra_body "$LLM_EXTRA_BODY"
           fi
           ocr config set mcp_servers.codebase-memory.command codebase-memory-mcp
           ocr config set mcp_servers.codebase-memory.setup 'codebase-memory-mcp cli list_projects'
           ocr config set mcp_servers.codebase-memory.env "[\"CBM_CACHE_DIR=${CBM_CACHE_DIR}\",\"CBM_LOG_LEVEL=info\"]"
+          if [ -z "${{ inputs.llm_url }}" ]; then
+            bash .mocr/scripts/verify-llm-endpoint.sh "$LLM_URL" "$LLM_MODEL" "local-max"
+          fi
 
       - name: Run Open Code Review
         id: review
-        if: steps.preflight.outputs.skip_review != 'true'
+        if: >-
+          steps.preflight.outputs.skip_review != 'true'
+          && (inputs.llm_url != '' || steps.max.outcome == 'success')
         env:
           # OCR runs the MCP server's setup command (`cli list_projects`) as a
           # child process. It applies mcp_servers.*.env to the server, not the
@@ -296,12 +312,24 @@ jobs:
           rc=$?
           set -e
 
+          echo "ocr_exit_code=${rc}" >> "$GITHUB_OUTPUT"
+
           bash .mocr/scripts/normalize-ocr-result.sh \
-            /tmp/ocr-result-raw.json /tmp/ocr-result.json
+            /tmp/ocr-result-raw.json /tmp/ocr-result.json || true
 
           echo "OCR stderr:"
           cat /tmp/ocr-stderr.log || true
-          echo "ocr_exit_code=${rc}" >> "$GITHUB_OUTPUT"
+
+          session_id=""
+          if [ -s /tmp/ocr-result.json ]; then
+            session_id=$(jq -r '.session_id // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+          fi
+          if [ -z "$session_id" ]; then
+            session_id=$(grep -oE 'Session: [0-9a-f-]{36}' /tmp/ocr-stderr.log 2>/dev/null | head -1 | awk '{print $2}' || true)
+          fi
+          if [ -n "$session_id" ]; then
+            echo "ocr_session_id=${session_id}" >> "$GITHUB_OUTPUT"
+          fi
 
           # Dump the review result (telemetry may have been stripped from raw stdout).
           echo "OCR result (metadata):"
@@ -311,7 +339,9 @@ jobs:
           # OCR emits token counts under .summary (json:"total_tokens" etc.).
           if [ -s /tmp/ocr-result.json ]; then
             status=$(jq -r '.status // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
-            session_id=$(jq -r '.session_id // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            if [ -z "$session_id" ]; then
+              session_id=$(jq -r '.session_id // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
+            fi
             comments=$(jq -r '(.comments | length) // 0' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
             warnings=$(jq -r '(.warnings | length) // 0' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
             tool_total=$(jq -r '.tool_calls.total // 0' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
@@ -320,7 +350,9 @@ jobs:
             output=$(jq -r '.summary.output_tokens // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
             files=$(jq -r '.summary.files_reviewed // empty' /tmp/ocr-result.json 2>/dev/null | head -n 1 | tr -d '\n\r' || true)
             echo "review_status=${status:-}" >> "$GITHUB_OUTPUT"
-            echo "ocr_session_id=${session_id:-}" >> "$GITHUB_OUTPUT"
+            if [ -n "$session_id" ]; then
+              echo "ocr_session_id=${session_id}" >> "$GITHUB_OUTPUT"
+            fi
             echo "comments_count=${comments:-0}" >> "$GITHUB_OUTPUT"
             echo "warnings_count=${warnings:-0}" >> "$GITHUB_OUTPUT"
             echo "tool_calls_total=${tool_total:-0}" >> "$GITHUB_OUTPUT"
@@ -372,7 +404,7 @@ jobs:
       - name: Upload OCR session audit
         if: >-
           inputs.debug_review
-          && steps.review.outputs.ocr_session_path != ''
+          && (steps.review.outputs.ocr_session_path != '' || steps.review.outputs.ocr_session_id != '')
         uses: actions/upload-artifact@v4.6.0
         with:
           name: ocr-session-${{ steps.review.outputs.ocr_session_id || github.run_id }}
@@ -394,10 +426,12 @@ jobs:
             && steps.review.outputs.files_reviewed != '0'
           )
         run: |
-          if [ "${{ steps.review.outputs.tool_calls_total }}" = "0" ]; then
-            echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls. For Qwen2.5 on local MAX, check that the Qwen2.5 tool-call proxy started (job summary). See OCR session trace / artifact."
+          if [ "${{ steps.review.outputs.ocr_exit_code }}" != "0" ]; then
+            echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. See OCR stderr / session artifact."
+          elif [ "${{ steps.review.outputs.tool_calls_total }}" = "0" ]; then
+            echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls. For Qwen2.5 on local MAX, check the Qwen2.5 tool-call proxy in the job summary."
           else
-            echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
+            echo "::error::Failing job: Open Code Review status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
           fi
           exit 1
 
