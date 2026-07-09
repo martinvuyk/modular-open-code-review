@@ -26,8 +26,8 @@ from urllib.parse import urlparse
 TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE
 )
-JSON_OBJECT_RE = re.compile(
-    r"\{[^{}]*\"name\"\s*:\s*\"[^\"]+\"[^{}]*\}", re.DOTALL
+MARKDOWN_FENCE_RE = re.compile(
+    r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE
 )
 
 UPSTREAM = "http://127.0.0.1:8000"
@@ -50,11 +50,89 @@ HOP_BY_HOP = frozenset(
 )
 
 
+def _strip_markdown_fences(content: str) -> str:
+    stripped = content.strip()
+    match = MARKDOWN_FENCE_RE.match(stripped)
+    if match:
+        return match.group(1).strip()
+    return stripped
+
+
+def _iter_balanced_json_objects(text: str) -> list[str]:
+    """Yield top-level {...} substrings using brace matching."""
+    objs: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(i, n):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    objs.append(text[i : j + 1])
+                    i = j + 1
+                    break
+        else:
+            i += 1
+    return objs
+
+
+def _parse_tool_call_payload(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    if isinstance(name, str) and name:
+        return data
+    fn = data.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn.get("name"):
+        return {
+            "name": fn["name"],
+            "arguments": fn.get("arguments", {}),
+        }
+    return None
+
+
+def _normalize_tool_args(name: str, args: Any) -> Any:
+    if name != "task_done":
+        return args
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return {"state": "DONE"}
+    if not isinstance(args, dict):
+        return {"state": "DONE"}
+    if not args:
+        return {"state": "DONE"}
+    if "state" not in args:
+        return {**args, "state": "DONE"}
+    return args
+
+
 def _make_tool_call(data: dict[str, Any]) -> dict[str, Any]:
     name = data.get("name")
     if not name or not isinstance(name, str):
         raise ValueError("tool call missing name")
     args = data.get("arguments", data.get("parameters", {}))
+    args = _normalize_tool_args(name, args)
     if isinstance(args, str):
         arg_str = args
     else:
@@ -66,38 +144,54 @@ def _make_tool_call(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _append_tool_call(
+    calls: list[dict[str, Any]], seen: set[tuple[str, str]], data: dict[str, Any]
+) -> None:
+    try:
+        call = _make_tool_call(data)
+    except ValueError:
+        return
+    key = (call["function"]["name"], call["function"]["arguments"])
+    if key in seen:
+        return
+    seen.add(key)
+    calls.append(call)
+
+
 def extract_tool_calls(content: str) -> list[dict[str, Any]]:
     if not content:
         return []
 
     calls: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
     for match in TOOL_CALL_BLOCK_RE.finditer(content):
-        block = match.group(1).strip()
+        block = _strip_markdown_fences(match.group(1).strip())
         try:
             data = json.loads(block)
         except json.JSONDecodeError:
             continue
-        if isinstance(data, dict) and data.get("name"):
-            try:
-                calls.append(_make_tool_call(data))
-            except ValueError:
-                continue
+        payload = _parse_tool_call_payload(data)
+        if payload:
+            _append_tool_call(calls, seen, payload)
 
     if not calls:
-        for match in JSON_OBJECT_RE.finditer(content):
+        normalized = _strip_markdown_fences(content)
+        candidates = [normalized, * _iter_balanced_json_objects(normalized)]
+        for candidate in candidates:
+            if not candidate:
+                continue
             try:
-                data = json.loads(match.group(0))
+                data = json.loads(candidate)
             except json.JSONDecodeError:
                 continue
-            if isinstance(data, dict) and data.get("name"):
-                try:
-                    calls.append(_make_tool_call(data))
-                except ValueError:
-                    continue
+            payload = _parse_tool_call_payload(data)
+            if payload:
+                _append_tool_call(calls, seen, payload)
 
-    stripped = content.strip()
+    stripped = _strip_markdown_fences(content)
     if not calls and stripped in {"task_done", "Task done", "TASK_DONE"}:
-        calls.append(_make_tool_call({"name": "task_done", "arguments": {}}))
+        _append_tool_call(calls, seen, {"name": "task_done", "arguments": {"state": "DONE"}})
 
     return calls
 
@@ -114,6 +208,7 @@ def promote_message(message: dict[str, Any]) -> dict[str, Any]:
     promoted = dict(message)
     promoted["tool_calls"] = tool_calls
     cleaned = TOOL_CALL_BLOCK_RE.sub("", content).strip()
+    cleaned = _strip_markdown_fences(cleaned)
     if cleaned in {"", "task_done", "Task done", "TASK_DONE"}:
         promoted["content"] = None
     else:
@@ -127,6 +222,7 @@ def promote_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
         return payload
     out = dict(payload)
     new_choices = []
+    promoted_any = False
     for choice in choices:
         if not isinstance(choice, dict):
             new_choices.append(choice)
@@ -139,12 +235,25 @@ def promote_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
         if promoted is msg:
             new_choices.append(choice)
         else:
+            promoted_any = True
             new_choice = dict(choice)
             new_choice["message"] = promoted
             if promoted.get("tool_calls"):
                 new_choice["finish_reason"] = "tool_calls"
             new_choices.append(new_choice)
     out["choices"] = new_choices
+    if promoted_any:
+        names = []
+        for choice in new_choices:
+            msg = choice.get("message", {}) if isinstance(choice, dict) else {}
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    names.append(fn["name"])
+        if names:
+            sys.stderr.write(
+                f"{LOG_PREFIX} promoted tool_calls: {', '.join(names)}\n"
+            )
     return out
 
 
@@ -181,6 +290,31 @@ def _forward_upstream(
         return status, resp_headers, raw
     finally:
         conn.close()
+
+
+def _maybe_promote_chat_completion(
+    method: str, path: str, body: bytes, raw: bytes
+) -> bytes:
+    if (
+        method != "POST"
+        or not path.rstrip("/").endswith("/chat/completions")
+        or not raw
+    ):
+        return raw
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    if not text.lstrip().startswith("{"):
+        return raw
+    try:
+        payload = json.loads(text)
+        req_payload = json.loads(body.decode("utf-8")) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return raw
+    if req_payload.get("stream") or not isinstance(payload, dict):
+        return raw
+    return json.dumps(promote_chat_completion(payload), ensure_ascii=False).encode("utf-8")
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -221,28 +355,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(502, f"upstream error: {exc}")
             return
 
-        out = raw
-        ctype = ""
-        for key, value in resp_headers:
-            if key.lower() == "content-type":
-                ctype = value.lower()
-                break
-
-        if (
-            method == "POST"
-            and path.rstrip("/").endswith("/chat/completions")
-            and "application/json" in ctype
-            and raw
-        ):
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-                req_payload = json.loads(body.decode("utf-8")) if body else {}
-                if not req_payload.get("stream") and isinstance(payload, dict):
-                    out = json.dumps(
-                        promote_chat_completion(payload), ensure_ascii=False
-                    ).encode("utf-8")
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                out = raw
+        out = _maybe_promote_chat_completion(method, path, body, raw)
 
         self.send_response(status)
         for key, value in resp_headers:
