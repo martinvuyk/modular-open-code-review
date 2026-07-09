@@ -73,6 +73,7 @@ OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX run
 | `llm_extra_body` | `""` | JSON merged into every LLM request. Only for thinking-capable models, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}`. Leave empty for Qwen2.5. |
 | `cache_models` | `true` | Cache the MAX venv + weights/compile artifacts (local MAX only; no effect with `llm_url`) |
 | `allow_gated_models` | `false` | Include license-gated candidates (e.g. Llama 3.1) in the local fallback chain. Default keeps only ungated Apache-2.0 models. |
+| `debug_review` | `false` | Log OCR session internals after review; upload `ocr-session` artifact; enable `OCR_ENABLE_TELEMETRY` + `OCR_CONTENT_LOGGING`. |
 | `action_ref` | `main` | Ref of this repo for scripts |
 
 ### `max_estimated_tokens`
@@ -116,26 +117,23 @@ All defaults live in [`config/versions.json`](config/versions.json):
 
 ### Model fallback chain
 
-The local CPU path uses an **ordered fallback chain** (see `candidates` in [`config/models.cpu.json`](config/models.cpu.json)), best reviewer first, safest last. [`select-model.sh`](scripts/select-model.sh) drops candidates that are gated (unless `allow_gated_models: true`) or don't fit the runner's free RAM, then [`setup-modular-max`](actions/setup-modular-max/action.yml) tries each survivor in order and serves the **first one that actually loads**. A candidate that fails to download/compile/serve (e.g. an unsupported GGUF) is logged and skipped, so the chain self-heals. The served model is shown in the job summary.
+The local CPU path uses an **ordered fallback chain** (see `candidates` in [`config/models.cpu.json`](config/models.cpu.json)). [`select-model.sh`](scripts/select-model.sh) drops candidates that are gated or don't fit RAM; [`setup-modular-max`](actions/setup-modular-max/action.yml) tries each survivor and serves the first that loads. The served model is shown in the job summary.
 
-Default chain (all Apache-2.0, ungated — no Hugging Face license acceptance):
+**MAX 26.4 on CPU (current pin).** Only **safetensors `float32`** models load reliably. Passing `--quantization-encoding q4_k` (GGUF) is rejected at startup:
 
-| Order | Model | Encoding | ~RAM | Notes |
-|-------|-------|----------|------|-------|
-| 1 | `Qwen/Qwen2.5-Coder-7B-Instruct` | `q4_k` (GGUF) | ~9 GB | Code-specialized 7B; best reviewer that fits 16 GB |
-| 2 | `Qwen/Qwen2.5-7B-Instruct` | `q4_k` (GGUF, sharded) | ~9 GB | General 7B; falls through if MAX can't load the shards |
-| 3 | `Qwen/Qwen2.5-1.5B-Instruct` | `float32` | ~11 GB | Safetensors, always loads on CPU; weak reviewer |
-| 4 | `Qwen/Qwen2.5-0.5B-Instruct` | `float32` | ~5 GB | Last-resort; tiny and unreliable, but always fits |
+```text
+quantization_encoding of 'q4_k' not supported by MAX engine
+```
 
-Opt-in (with `allow_gated_models: true`, inserted after the Qwen 7B entries): `modularai/Llama-3.1-8B-Instruct-GGUF` (`q4_k`) — a turnkey MAX GGUF and strong reviewer, but under the Llama 3.1 Community License rather than Apache-2.0.
+So the default chain is **`Qwen2.5-1.5B-Instruct` → `Qwen2.5-0.5B-Instruct`** (both `float32`). A 7B model at `float32` needs ~28 GB and OOMs on 16 GB runners. For strong reviews use `llm_url` (hosted model) or a larger runner.
 
-**Quantization on CPU.** MAX serves `q4_k`/`q6_k`/`q4_0` GGUF weights on CPU (`bfloat16` is GPU-only). A 7-8B model at `q4_k` is ~4.5–5 GB of weights, so it fits a 16 GB runner with headroom — whereas the same model at `float32` (≈28 GB for 7B) would OOM-kill during compile. That's why the strong models in the chain are quantized and only the small fallbacks are `float32`. For non-`modularai` GGUFs, MAX gets its architecture/config/tokenizer from the base repo (`--model`) and the quantized weights from a downloaded file (`--weight-path`); [`download-gguf.sh`](scripts/download-gguf.sh) fetches the file (and any shards) first.
+**Latency.** CPU `float32` 1.5B reviews take minutes per file. The warm workflow on `main` pre-compiles models so PR jobs restore cache instead of cold-starting.
 
-**Latency caveat.** CPU inference of a 7B model is slow — expect reviews to take **tens of minutes** (a 0.5B review already took ~6 min). For fast, high-quality reviews use `llm_url` to point at a hosted model, or run on a larger/GPU runner.
+**RAM pre-flight.** Peak RAM is estimated from parameter count × encoding bytes + safety factor (see `ram_estimate` in config). Candidates that exceed `MemAvailable` are dropped.
 
-**RAM pre-flight.** For each candidate, [`select-model.sh`](scripts/select-model.sh) estimates peak RAM from its parameter count (config `params`, else the Hugging Face API, else the size parsed from the id) times the encoding's bytes-per-weight, plus `ram_estimate.safety_factor` and `ram_estimate.base_overhead_gb`. Candidates that exceed `MemAvailable` are dropped; if none fit, the review is skipped with a clear reason instead of letting MAX OOM mid-compile. Needed-vs-free RAM is printed in the job summary.
+**Debugging OCR.** Set `debug_review: true` to enable telemetry content logging, print a session trace in the job log, and upload the JSONL audit as a workflow artifact (`ocr-session-<id>`). Locally: `ocr session list` / `ocr session show <id>`. On CI the audit lives only on the ephemeral runner unless uploaded — previous runs without `debug_review` left no retrievable artifact.
 
-Note that `Qwen/Qwen2.5-3B-Instruct` (and `Qwen2.5-Coder-3B`) are **not** Apache-2.0 (Qwen Research License, non-commercial), so they are intentionally excluded from the default chain.
+**Tool-calling failure.** OCR only creates comments when the LLM calls tools (`code_comment`, `task_done`). If `tool_calls.total == 0` after a non-empty diff, the workflow fails (model/endpoint issue, not “clean code”).
 
 ## Secrets
 
@@ -179,7 +177,7 @@ Caching is optional: set `cache_models: false` to disable it, or use `llm_url` t
 
 The `setup-modular-max` action serves the first working candidate (compiling on first load, which persists to `MODULAR_MAX_CACHE_DIR`), saves caches on success, and waits up to 30 minutes per candidate for the health endpoint on cold start.
 
-**Recommended:** add the MAX cache warmer (copy [`examples/consumer-warm-max-workflow.yml`](examples/consumer-warm-max-workflow.yml) to `.github/workflows/llm-warm-max.yml`) so pushes to `main` pre-download and compile every model in the chain from [`config/models.cpu.json`](config/models.cpu.json). PR reviews then restore that cache instead of starting cold.
+**Recommended:** add the MAX cache warmer (copy [`examples/consumer-warm-max-workflow.yml`](examples/consumer-warm-max-workflow.yml) to `.github/workflows/llm-warm-max.yml`) so **pushes to `main`** pre-compile every model in the chain. PR jobs restore that cache read-only (`cache write denied` on `pull_request_target` is expected). After changing `models.cpu.json` or the cache key (`-v3`), merge to `main` once so the warm job populates the new key before expecting fast PR reviews.
 
 **Alternatives:** use `llm_url` to point at an external API and skip local MAX; or run [`modular/max-full`](https://docs.modular.com/max/container/) in Docker with the same volume mounts (GPU-oriented, but supports `--devices cpu`).
 

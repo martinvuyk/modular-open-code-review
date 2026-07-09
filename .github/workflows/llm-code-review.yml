@@ -18,4 +18,6 @@ jobs:
         (startsWith(github.event.comment.body, '/open-code-review') ||
          startsWith(github.event.comment.body, '@open-code-review')))
     uses: ./.github/workflows/review-pr.yml
+    with:
+      debug_review: true
     secrets: inherit

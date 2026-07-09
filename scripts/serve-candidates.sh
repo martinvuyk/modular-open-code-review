@@ -66,7 +66,8 @@ for (( i = 0; i < count; i++ )); do
   nohup max serve "${args[@]}" --allow-extra-request-fields >> "$log" 2>&1 &
   pid=$!
 
-  if bash "${SCRIPT_DIR}/wait-for-http.sh" "http://127.0.0.1:${MAX_PORT}/v1/health" "$SERVE_TIMEOUT"; then
+  if bash "${SCRIPT_DIR}/wait-for-max-serve.sh" \
+    "http://127.0.0.1:${MAX_PORT}/v1/health" "$pid" "$log" "$SERVE_TIMEOUT"; then
     echo "Candidate ${id} is serving (pid ${pid})."
     warmed=$((warmed + 1))
     if [[ "$STOP_AT_FIRST" == "true" ]]; then
