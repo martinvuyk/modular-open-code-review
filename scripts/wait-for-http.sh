@@ -6,6 +6,7 @@ URL="${1:?usage: wait-for-http.sh <url> [timeout_seconds]}"
 TIMEOUT="${2:-600}"
 INTERVAL="${3:-5}"
 API_KEY="sk-proj-9dF2aQx7bR4tYw8kZ1vN3mP6sL0hG5jU2cE"
+echo "API_KEY: ${API_KEY}"
 
 deadline=$((SECONDS + TIMEOUT))
 
