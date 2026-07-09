@@ -277,6 +277,7 @@ jobs:
             if [ "$LLM_PORT" != "$MAX_SERVE_PORT" ]; then
               bash .mocr/scripts/verify-llm-endpoint.sh "$LLM_URL" "$LLM_MODEL" "local-max"
             fi
+            python3 .mocr/scripts/test_qwen25_max_tool_call_proxy.py -q
           fi
 
       - name: Run Open Code Review
@@ -305,9 +306,8 @@ jobs:
 
           # ocr review exits 0 on success (with or without findings) and
           # non-zero only on operational failure. Capture the code instead of
-          # discarding it so a genuine failure fails the job (see "Fail on
-          # review error" below). We still let later steps run first so any
-          # error comment is posted to the PR.
+          # discarding it; "Evaluate review outcome" decides whether to publish
+          # a PR comment and whether the job should fail.
           set +e
           ocr review \
             --from "$BASE_REF" \
@@ -389,6 +389,8 @@ jobs:
                 }' "$jsonl" 2>/dev/null || true
               echo "--- tool executions ---"
               jq -c 'select(.type=="tool_call") | {tool_name, ok, result: ((.result // "") | tostring | .[0:200])}' "$jsonl" 2>/dev/null || true
+              session_tools=$(jq -c 'select(.type=="tool_call")' "$jsonl" 2>/dev/null | wc -l | tr -d ' ')
+              echo "session_tool_executions=${session_tools:-0}" >> "$GITHUB_OUTPUT"
               cp "$jsonl" /tmp/ocr-session.jsonl
               echo "ocr_session_path=/tmp/ocr-session.jsonl" >> "$GITHUB_OUTPUT"
             else
@@ -400,8 +402,53 @@ jobs:
             echo "::error::Open Code Review failed (exit ${rc}) — see stderr above."
           fi
 
+      - name: Evaluate review outcome
+        id: outcome
+        if: steps.preflight.outputs.skip_review != 'true'
+        run: |
+          set -euo pipefail
+          publish=true
+          fail=false
+          reason=""
+
+          rc="${{ steps.review.outputs.ocr_exit_code }}"
+          status="${{ steps.review.outputs.review_status }}"
+          tool_total="${{ steps.review.outputs.tool_calls_total }}"
+          session_tools="${{ steps.review.outputs.session_tool_executions }}"
+          files="${{ steps.review.outputs.files_reviewed }}"
+
+          if [ -z "$session_tools" ]; then session_tools=0; fi
+          effective_tools="${tool_total:-0}"
+          if [ "$session_tools" -gt "$effective_tools" ]; then
+            effective_tools="$session_tools"
+          fi
+
+          if [ -n "$rc" ] && [ "$rc" != "0" ]; then
+            fail=true
+            reason="ocr_exit_${rc}"
+            # post-review.js can surface stderr when the result JSON is unusable.
+            publish=true
+          elif [ "$status" = "completed_with_errors" ]; then
+            fail=true
+            reason="completed_with_errors"
+            publish=false
+          elif [ -z "${{ inputs.llm_url }}" ] \
+            && [ "${effective_tools:-0}" = "0" ] \
+            && [ -n "$files" ] && [ "$files" != "0" ]; then
+            fail=true
+            reason="zero_tool_calls"
+            publish=false
+          fi
+
+          echo "publish_comments=${publish}" >> "$GITHUB_OUTPUT"
+          echo "fail_job=${fail}" >> "$GITHUB_OUTPUT"
+          echo "fail_reason=${reason}" >> "$GITHUB_OUTPUT"
+
       - name: Post review comments
-        if: steps.preflight.outputs.skip_review != 'true' && inputs.post_comments
+        if: >-
+          steps.preflight.outputs.skip_review != 'true'
+          && inputs.post_comments
+          && steps.outcome.outputs.publish_comments == 'true'
         uses: martinvuyk/modular-open-code-review/actions/post-review-comments@main
         with:
           ocr_result_path: /tmp/ocr-result.json
@@ -417,28 +464,24 @@ jobs:
           path: /tmp/ocr-session.jsonl
           if-no-files-found: ignore
 
-      # Fail on a hard error (non-zero exit) OR on completed_with_errors, which
-      # means one or more files could not be reviewed even though OCR exits 0 —
-      # otherwise an incomplete review would masquerade as a green success.
+      # Fail after optional PR comment so operational errors can still post stderr.
       - name: Fail on review error
-        if: >-
-          (steps.review.outputs.ocr_exit_code != '' && steps.review.outputs.ocr_exit_code != '0')
-          || steps.review.outputs.review_status == 'completed_with_errors'
-          || (
-            steps.preflight.outputs.skip_review != 'true'
-            && inputs.llm_url == ''
-            && steps.review.outputs.tool_calls_total == '0'
-            && steps.review.outputs.files_reviewed != ''
-            && steps.review.outputs.files_reviewed != '0'
-          )
+        if: steps.outcome.outputs.fail_job == 'true'
         run: |
-          if [ "${{ steps.review.outputs.ocr_exit_code }}" != "0" ]; then
-            echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. See OCR stderr / session artifact."
-          elif [ "${{ steps.review.outputs.tool_calls_total }}" = "0" ]; then
-            echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls. For Qwen2.5 on local MAX, check the Qwen2.5 tool-call proxy in the job summary."
-          else
-            echo "::error::Failing job: Open Code Review status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
-          fi
+          case "${{ steps.outcome.outputs.fail_reason }}" in
+            ocr_exit_*)
+              echo "::error::Failing job: Open Code Review exit=${{ steps.review.outputs.ocr_exit_code }}, status=${{ steps.review.outputs.review_status || 'n/a' }}. See OCR stderr / session artifact."
+              ;;
+            zero_tool_calls)
+              echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls. For Qwen2.5 on local MAX, check the Qwen2.5 tool-call proxy in the job summary."
+              ;;
+            completed_with_errors)
+              echo "::error::Failing job: Open Code Review status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
+              ;;
+            *)
+              echo "::error::Failing job: Open Code Review did not pass validation (${{ steps.outcome.outputs.fail_reason || 'unknown' }})."
+              ;;
+          esac
           exit 1
 
       - name: Job summary
@@ -460,7 +503,7 @@ jobs:
             echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
             echo "- Review status: ${{ steps.review.outputs.review_status || 'n/a' }}"
             echo "- Comments: ${{ steps.review.outputs.comments_count || 'n/a' }} / Warnings: ${{ steps.review.outputs.warnings_count || 'n/a' }}"
-            echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }}"
+            echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }} (session executions: ${{ steps.review.outputs.session_tool_executions || 'n/a' }})"
             echo "- Qwen2.5 MAX tool-call proxy: ${{ steps.max.outputs.qwen25_max_tool_call_proxy || 'n/a' }}"
             echo "- OCR session: ${{ steps.review.outputs.ocr_session_id || 'n/a' }}"
             echo "- Review exit code: ${{ steps.review.outputs.ocr_exit_code || 'n/a' }}"
