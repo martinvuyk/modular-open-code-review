@@ -235,15 +235,42 @@ class ExtractToolCallsTest(unittest.TestCase):
         )
         choice = out["choices"][0]
         self.assertEqual(choice["finish_reason"], "tool_calls")
+        names = [tc["function"]["name"] for tc in choice["message"]["tool_calls"]]
+        self.assertEqual(names, ["code_comment", "task_done"])
         tc = choice["message"]["tool_calls"][0]
-        self.assertEqual(tc["function"]["name"], "code_comment")
         args = json.loads(tc["function"]["arguments"])
         self.assertEqual(args["path"], "scripts/wait-for-http.sh")
         self.assertIn("API_KEY=", args["comments"][0].get("existing_code", ""))
+        self.assertEqual(args["comments"][0]["category"], "security")
         self.assertIsNone(choice["message"]["content"])
 
+    def test_promote_paren_task_done_content(self) -> None:
+        out = proxy.promote_chat_completion(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "(task_done)"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+        choice = out["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(
+            choice["message"]["tool_calls"][0]["function"]["name"], "task_done"
+        )
+
     def test_slash_task_done_promoted(self) -> None:
-        for text in ("/task_done", "task_done", "Task Done", "\\task_done"):
+        for text in (
+            "/task_done",
+            "task_done",
+            "Task Done",
+            "\\task_done",
+            "(task_done)",
+            "[task_done]",
+            "{task_done}",
+        ):
             with self.subTest(text=text):
                 calls = proxy.extract_tool_calls(text)
                 self.assertEqual(len(calls), 1)
@@ -354,6 +381,11 @@ class ExtractToolCallsTest(unittest.TestCase):
         self.assertIn(proxy.TOOL_POLICY_MARKER, system)
         self.assertIn("scripts/wait-for-http.sh", system)
         self.assertIn("<tool_call>", system)
+        self.assertIn(
+            '<tool_call>{"name":"task_done","arguments":{"state":"DONE"}}</tool_call>',
+            system,
+        )
+        self.assertIn("never (task_done)", system)
         out2, changed2 = proxy.rewrite_chat_request(out)
         self.assertFalse(changed2)
 
