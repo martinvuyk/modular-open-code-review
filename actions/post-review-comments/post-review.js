@@ -27,7 +27,7 @@ module.exports = async function postReviewComments({ github, context, core }) {
           owner: context.repo.owner,
           repo: context.repo.repo,
           issue_number: context.issue.number,
-          body: `⚠️ **OpenCodeReview** encountered an error:\n${fencedBlock(stderr)}`,
+          body: formatErrorComment(stderr),
         });
       }
     }
@@ -39,6 +39,20 @@ module.exports = async function postReviewComments({ github, context, core }) {
 
   if (comments.length === 0) {
     const message = result.message || 'No comments generated. Looks good to me.';
+    const stderr = fs.existsSync(stderrPath)
+      ? fs.readFileSync(stderrPath, 'utf8').trim()
+      : '';
+    // OCR often says "check your LLM configuration and API key" for any
+    // all-files-failed case (including HTTP timeouts). Prefer a clearer note.
+    if (looksLikeOperationalFailure(message, stderr, result)) {
+      await github.rest.issues.createComment({
+        owner: context.repo.owner,
+        repo: context.repo.repo,
+        issue_number: context.issue.number,
+        body: formatErrorComment(stderr || message, message),
+      });
+      return;
+    }
     await github.rest.issues.createComment({
       owner: context.repo.owner,
       repo: context.repo.repo,
@@ -252,6 +266,53 @@ module.exports = async function postReviewComments({ github, context, core }) {
     const matches = String(content || '').match(/`+/g) || [];
     const maxTicks = matches.reduce((max, ticks) => Math.max(max, ticks.length), 0);
     return '`'.repeat(Math.max(3, maxTicks + 1));
+  }
+
+  function looksLikeOperationalFailure(message, stderr, result) {
+    const blob = `${message || ''}\n${stderr || ''}\n${JSON.stringify(result || {})}`;
+    if (/context deadline exceeded/i.test(blob)) return true;
+    if (/LLM completion error/i.test(blob)) return true;
+    if (/all \d+ file review\(s\) failed/i.test(blob)) return true;
+    if (/check your LLM configuration and API key/i.test(message || '')) return true;
+    if (result && result.status && result.status !== 'success' && !(result.comments || []).length) {
+      return true;
+    }
+    return false;
+  }
+
+  function explainFailure(stderr, message) {
+    const blob = `${stderr || ''}\n${message || ''}`;
+    if (/context deadline exceeded/i.test(blob)) {
+      return (
+        'The LLM request timed out (`context deadline exceeded`). ' +
+        'On local CPU this usually means OCR’s per-request HTTP timeout (default 300s) ' +
+        'was too short — not a bad API key. The workflow should set `OCR_LLM_TIMEOUT` ' +
+        '(e.g. 900) for local MAX.'
+      );
+    }
+    if (/unknown config key/i.test(blob)) {
+      return 'OCR rejected a config key. Check the job log for `unknown config key` (not an API-key issue).';
+    }
+    if (/check your LLM configuration and API key/i.test(blob)) {
+      return (
+        'OCR reported that all file reviews failed. Its stock message mentions an API key, ' +
+        'but the real cause is usually in the log below (timeout, bad tool calls, unreachable LLM, etc.).'
+      );
+    }
+    return null;
+  }
+
+  function formatErrorComment(stderr, message) {
+    const explanation = explainFailure(stderr, message);
+    let body = '⚠️ **OpenCodeReview** encountered an error';
+    if (explanation) {
+      body += `\n\n${explanation}`;
+    }
+    const detail = (stderr || message || '').trim();
+    if (detail) {
+      body += `\n\n${fencedBlock(detail)}`;
+    }
+    return body;
   }
 
   function logRateLimitQuota(response, tag) {

@@ -263,11 +263,8 @@ jobs:
           ocr config set llm.auth_token "local-max"
           ocr config set llm.model "$LLM_MODEL"
           ocr config set llm.use_anthropic false
-          # Local CPU MAX often needs >5m per completion (Qwen 1.5B essays were
-          # already ~2–4m). OCR's default llm.timeout_sec is 300 → context deadline.
-          if [ -z "${{ inputs.llm_url }}" ]; then
-            ocr config set llm.timeout_sec 900
-          fi
+          # Note: OCR 1.7.x has no llm.timeout_sec config key. Use OCR_LLM_TIMEOUT
+          # on the review step instead (see below).
           if [ -n "${LLM_EXTRA_BODY:-}" ]; then
             ocr config set llm.extra_body "$LLM_EXTRA_BODY"
           fi
@@ -301,6 +298,12 @@ jobs:
           OCR_CONTENT_LOGGING: ${{ inputs.debug_review && '1' || '' }}
         run: |
           set -euo pipefail
+          # Per-request HTTP timeout (seconds). OCR 1.7 default is 300; local CPU
+          # Qwen often needs longer. Env works on 1.7.x — llm.timeout_sec is not a
+          # supported `ocr config set` key.
+          if [ -z "${{ inputs.llm_url }}" ]; then
+            export OCR_LLM_TIMEOUT=900
+          fi
           if [ "${{ github.event_name }}" = "pull_request_target" ]; then
             BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
             HEAD_SHA="${{ github.event.pull_request.head.sha }}"
