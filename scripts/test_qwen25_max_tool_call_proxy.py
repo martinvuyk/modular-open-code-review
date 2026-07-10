@@ -207,8 +207,11 @@ class ExtractToolCallsTest(unittest.TestCase):
             "    - The API key assignment directly in the script might expose the secret key.\n"
             "```bash\n"
             'API_KEY="sk-proj-9dF2aQx7bR4tYw8kZ1vN3mP6sL0hG5jU2cE"\n'
+            'echo "API_KEY: ${API_KEY}"\n'
+            "while (( SECONDS > deadline )); do\n"
+            '  if eval "curl -k -fsS $URL" >/dev/null 2>&1; then\n'
             "```\n"
-            "2. **Suggested Fix**: use an environment variable instead.\n"
+            "### Conclusion\nThe code looks clean overall.\n"
         )
         # Pad to clear the length threshold.
         essay = essay + ("More review detail. " * 20)
@@ -240,9 +243,54 @@ class ExtractToolCallsTest(unittest.TestCase):
         tc = choice["message"]["tool_calls"][0]
         args = json.loads(tc["function"]["arguments"])
         self.assertEqual(args["path"], "scripts/wait-for-http.sh")
-        self.assertIn("API_KEY=", args["comments"][0].get("existing_code", ""))
-        self.assertEqual(args["comments"][0]["category"], "security")
+        comments = args["comments"]
+        self.assertGreaterEqual(len(comments), 2)
+        bodies = "\n".join(c["content"] for c in comments)
+        self.assertNotIn("Promoted from model prose", bodies)
+        self.assertNotIn("### Conclusion", bodies)
+        self.assertNotIn("Potential Issues", bodies)
+        codes = [c.get("existing_code", "") for c in comments]
+        self.assertTrue(any("API_KEY=" in c for c in codes))
+        self.assertTrue(any("SECONDS >" in c or "eval" in c for c in codes))
+        self.assertTrue(all(len(c["content"]) <= 500 for c in comments))
         self.assertIsNone(choice["message"]["content"])
+
+    def test_refuse_fluff_only_prose_promotion(self) -> None:
+        essay = (
+            "### Analysis\n\n#### Potential Issues and Suggestions:\n\n"
+            "1. **Security Concerns**:\n"
+            "    - SQL Injection: Not applicable since the input is sanitized.\n"
+            "    - XSS: Not applicable.\n"
+            "2. **Performance**: N+1 Queries: None observed.\n"
+            "### Conclusion\n"
+            "The code looks clean, maintainable, and performs its intended function.\n"
+        ) + ("More review detail. " * 30)
+        out = proxy.promote_chat_completion(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": essay},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "<current_file_path>scripts/wait-for-http.sh"
+                            "</current_file_path>"
+                        ),
+                    }
+                ]
+            },
+        )
+        # Fluff-only essays must not become inline comments.
+        self.assertIsNone(
+            out["choices"][0]["message"].get("tool_calls")
+        )
+        self.assertEqual(out["choices"][0]["finish_reason"], "stop")
 
     def test_promote_paren_task_done_content(self) -> None:
         out = proxy.promote_chat_completion(
@@ -386,6 +434,9 @@ class ExtractToolCallsTest(unittest.TestCase):
             system,
         )
         self.assertIn("never (task_done)", system)
+        self.assertIn("One defect", system)
+        self.assertIn("Conclusion", system)
+        self.assertIn("existing_code", system)
         out2, changed2 = proxy.rewrite_chat_request(out)
         self.assertFalse(changed2)
 

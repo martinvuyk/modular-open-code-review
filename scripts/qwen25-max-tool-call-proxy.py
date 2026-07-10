@@ -13,7 +13,8 @@ API response. This proxy:
    empty-tool nudge than OCR's default).
 2. Forwards to MAX and rewrites non-streaming responses when ``tool_calls``
    is empty but the content looks like a Hermes/JSON tool call, or when the
-   model dumps a review essay (promoted to ``code_comment``).
+   model dumps a review essay (extracted into short per-issue ``code_comment``
+   entries when concrete defects can be anchored; fluff-only essays are not posted).
 """
 from __future__ import annotations
 
@@ -89,13 +90,17 @@ REVIEW_PROSE_MARKERS = (
     "line-by-line",
     "### analysis",
     "## analysis",
+    "current file analysis",
+    "key changes",
     "hardcoded",
     "api_key",
     "secret key",
     "command injection",
+    "conclusion",
 )
 MIN_REVIEW_PROSE_CHARS = 350
-MAX_PROMOTED_COMMENT_CHARS = 3500
+# Keep promoted inline comments short — never dump the whole essay.
+MAX_PROMOTED_COMMENT_CHARS = 480
 
 # Injected once per conversation; marker prevents double-injection on retries.
 TOOL_POLICY_MARKER = "<!-- qwen25-max-tool-policy -->"
@@ -104,13 +109,16 @@ OCR_EMPTY_TOOL_NUDGE = (
     "Please try again or use task_done if finished."
 )
 STRONG_EMPTY_TOOL_NUDGE = (
-    "You did not call any tools. Do NOT write a markdown analysis or essay. "
-    "If you found issues in the diff, call code_comment now with path set to the "
-    "current file and comments[].existing_code copied from the diff. "
+    "You did not call any tools. Do NOT write a markdown analysis, Conclusion, "
+    "or full-file rewrite. "
+    "For EACH real defect in the DIFF, call code_comment with one comments[] "
+    "entry: short what/why/fix (1-3 sentences) and existing_code copied from "
+    "the changed line. Multiple comments in one tool call is OK. "
+    "Do not narrate correct code, or praise the change. "
     "To finish, emit exactly: "
     '<tool_call>{"name":"task_done","arguments":{"state":"DONE"}}</tool_call> '
     "(never /task_done, never (task_done), never prose). "
-    "Call task_done ONLY if there are truly no issues. Prose reviews are invalid."
+    "Call task_done ONLY after filing comments, or if there are truly no issues."
 )
 
 UPSTREAM = "http://127.0.0.1:8000"
@@ -488,67 +496,143 @@ def looks_like_review_prose(content: str) -> bool:
     return any(marker in lower for marker in REVIEW_PROSE_MARKERS)
 
 
-def _existing_code_hint(content: str) -> str | None:
-    """Best-effort snippet for OCR line resolution from prose/code fences."""
-    code_needles = (
-        "API_KEY=",
-        "while (( SECONDS",
-        'eval "curl',
-        "eval 'curl",
-        "curl -k",
-    )
-
-    def pick_from(text: str) -> str | None:
-        for line in text.splitlines():
-            s = line.strip().lstrip("+").strip()
-            s = re.sub(r"^[*`-]+\s*", "", s).strip("`")
-            # Skip markdown prose that happens to mention eval/curl.
-            if (
-                not s
-                or s.startswith("#")
-                or s.startswith("**")
-                or re.match(r"^\d+\.\s", s)
-            ):
-                continue
-            if any(needle in s for needle in code_needles):
-                return s[:200]
-        return None
-
+def _iter_codeish_lines(content: str) -> list[str]:
+    """Collect likely source lines from fences and bare code-looking lines."""
+    lines: list[str] = []
     for fence in re.finditer(
         r"```(?:bash|sh|shell|diff)?\s*\n(.*?)```", content, re.DOTALL
     ):
-        hit = pick_from(fence.group(1))
-        if hit:
-            return hit
-    return pick_from(content)
+        lines.extend(fence.group(1).splitlines())
+    lines.extend(content.splitlines())
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        s = line.strip().lstrip("+").strip()
+        s = re.sub(r"^[*`-]+\s*", "", s).strip("`")
+        if (
+            not s
+            or s.startswith("#")
+            or s.startswith("**")
+            or s.startswith("###")
+            or re.match(r"^\d+\.\s", s)
+            or s.lower().startswith("content:")
+            or s.lower().startswith("comments:")
+        ):
+            continue
+        if s not in seen:
+            seen.add(s)
+            cleaned.append(s)
+    return cleaned
+
+
+def _first_line_matching(lines: list[str], *needles: str) -> str | None:
+    for line in lines:
+        if all(n in line for n in needles):
+            return line[:200]
+    for line in lines:
+        if any(n in line for n in needles):
+            return line[:200]
+    return None
+
+
+def extract_findings_from_prose(content: str) -> list[dict[str, Any]]:
+    """Turn a review essay into short per-issue code_comment entries.
+
+    Weak models dump Analysis/Conclusion essays. We only keep concrete defects
+    we can anchor to a changed line — never the essay itself.
+    """
+    lines = _iter_codeish_lines(content)
+    lower = content.lower()
+    findings: list[dict[str, Any]] = []
+
+    api_line = _first_line_matching(lines, "API_KEY=")
+    echo_line = _first_line_matching(lines, "echo", "API_KEY")
+    if api_line or "hardcoded" in lower or "api_key" in lower or "secret" in lower:
+        anchor = api_line or echo_line
+        if anchor:
+            text = (
+                "Hardcoded secret in source. Load from the environment or a secret "
+                "store instead, and never echo credentials to logs."
+            )
+            if echo_line and echo_line != api_line:
+                text = (
+                    "Hardcoded API key is committed and echoed to stdout, which "
+                    "leaks credentials in CI logs. Use an env var/secret store and "
+                    "remove the echo."
+                )
+            findings.append(
+                {
+                    "content": text,
+                    "existing_code": anchor,
+                    "category": "security",
+                    "severity": "high",
+                }
+            )
+
+    loop_line = _first_line_matching(lines, "SECONDS >")
+    if loop_line or (
+        "seconds >" in lower and ("deadline" in lower or "while" in lower)
+    ):
+        anchor = loop_line or "while (( SECONDS > deadline )); do"
+        findings.append(
+            {
+                "content": (
+                    "Loop condition is inverted (`SECONDS > deadline`). The body "
+                    "never runs while waiting; restore `SECONDS < deadline`."
+                ),
+                "existing_code": anchor,
+                "category": "correctness",
+                "severity": "high",
+            }
+        )
+
+    eval_line = _first_line_matching(lines, "eval", "curl")
+    if eval_line or ("eval" in lower and "curl" in lower):
+        anchor = eval_line or 'eval "curl -k -fsS $URL"'
+        findings.append(
+            {
+                "content": (
+                    "`eval` on an unsanitized `$URL` enables command injection; "
+                    "`curl -k` also disables TLS verification. Call "
+                    '`curl -fsS "$URL"` directly.'
+                ),
+                "existing_code": anchor,
+                "category": "security",
+                "severity": "high",
+            }
+        )
+
+    # Deduplicate by existing_code.
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for finding in findings:
+        key = finding.get("existing_code") or finding["content"]
+        if key in seen:
+            continue
+        seen.add(key)
+        body = finding["content"]
+        if len(body) > MAX_PROMOTED_COMMENT_CHARS:
+            finding = dict(finding)
+            finding["content"] = (
+                body[: MAX_PROMOTED_COMMENT_CHARS - 20].rstrip() + "\n…(truncated)"
+            )
+        out.append(finding)
+    return out
 
 
 def prose_to_code_comment(
     content: str, current_path: str | None
 ) -> dict[str, Any] | None:
-    """Wrap a review essay as a structured code_comment tool call for OCR."""
+    """Convert a review essay into structured per-issue code_comment entries."""
     if not current_path or not looks_like_review_prose(content):
         return None
-    body = content.strip()
-    if len(body) > MAX_PROMOTED_COMMENT_CHARS:
-        body = body[: MAX_PROMOTED_COMMENT_CHARS - 20].rstrip() + "\n…(truncated)"
-    comment: dict[str, Any] = {
-        "content": (
-            "[Promoted from model prose — call `code_comment` next time.]\n\n" + body
-        ),
-        "category": "security"
-        if any(m in body.lower() for m in ("api_key", "secret", "hardcoded"))
-        else "maintainability",
-        "severity": "high"
-        if any(m in body.lower() for m in ("api_key", "secret", "hardcoded"))
-        else "medium",
-    }
-    hint = _existing_code_hint(content)
-    if hint:
-        comment["existing_code"] = hint
+    comments = extract_findings_from_prose(content)
+    if not comments:
+        # Refuse to post Analysis/Conclusion fluff as an inline comment.
+        return None
     return {
         "name": "code_comment",
-        "arguments": {"path": current_path, "comments": [comment]},
+        "arguments": {"path": current_path, "comments": comments},
     }
 
 
@@ -557,8 +641,13 @@ def build_tool_policy_text(current_path: str | None) -> str:
     # Keep this short: every token slows CPU decode and risks OCR's HTTP deadline.
     comment_example = (
         f'<tool_call>{{"name":"code_comment","arguments":{{"path":"{path}",'
-        f'"comments":[{{"content":"Hardcoded secret.","existing_code":"API_KEY=...",'
-        f'"category":"security","severity":"high"}}]}}}}</tool_call>'
+        f'"comments":['
+        f'{{"content":"Hardcoded secret — use an env var; never echo it.",'
+        f'"existing_code":"API_KEY=...","category":"security","severity":"high"}},'
+        f'{{"content":"Inverted wait loop — use SECONDS < deadline.",'
+        f'"existing_code":"while (( SECONDS > deadline )); do",'
+        f'"category":"correctness","severity":"high"}}'
+        f"]}}}}</tool_call>"
     )
     done_example = (
         '<tool_call>{"name":"task_done","arguments":{"state":"DONE"}}</tool_call>'
@@ -568,13 +657,18 @@ def build_tool_policy_text(current_path: str | None) -> str:
         "## Tool-calling policy (mandatory)\n"
         "- Allowed tools ONLY: file_read, file_read_diff, code_comment, task_done, "
         "file_find, code_search. Never invent tools (e.g. code_review_current_file).\n"
-        "- No markdown essays. Report issues only via code_comment.\n"
+        "- No markdown essays, no Analysis/Conclusion sections, no full-file rewrites, "
+        "no suggested replacement scripts.\n"
+        "- One defect → one comments[] entry (multiple entries in one code_comment OK). "
+        "Each content is 1-3 sentences (what/why/fix). "
+        "existing_code must be the exact changed line from the DIFF.\n"
+        "- Comment ONLY on real defects in newly added/changed lines. "
+        "Do not narrate correct code, or praise the change.\n"
         f"- Paths are repo-relative (`{path}`), never `/{path}` or `<current_file_path>`.\n"
         "- Finish ONLY with this exact tool call (never prose, never /task_done, "
         "never (task_done)): "
         f"{done_example}\n"
-        f"- Call task_done only after code_comment, or if there are truly no issues.\n"
-        f"- Example code_comment: {comment_example}\n"
+        f"- Example (two findings): {comment_example}\n"
     )
 
 
@@ -659,8 +753,10 @@ def rewrite_chat_request(req_payload: dict[str, Any]) -> tuple[dict[str, Any], b
         replaced = text.replace(OCR_EMPTY_TOOL_NUDGE, STRONG_EMPTY_TOOL_NUDGE)
         if prose_escape:
             replaced += (
-                " Your previous message was a prose review; convert each "
-                "finding into code_comment tool calls now."
+                " Your previous message was a prose review; convert EACH finding "
+                "into a separate comments[] entry on code_comment now "
+                "(short what/why/fix + existing_code from the DIFF). "
+                "Do not resend the essay."
             )
         new_messages[i] = _set_message_text(msg, replaced)
         changed = True
