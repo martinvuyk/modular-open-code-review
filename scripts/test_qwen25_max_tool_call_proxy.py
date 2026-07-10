@@ -28,12 +28,12 @@ class ExtractToolCallsTest(unittest.TestCase):
 
     def test_bare_json_with_nested_arguments(self) -> None:
         content = (
-            '{"name": "code_review", "arguments": {"path": "<current_file_path>", '
+            '{"name": "code_search", "arguments": {"path": "<current_file_path>", '
             '"diff": "<current_file_diff>", "reviewer_id": "user"}}'
         )
         calls = proxy.extract_tool_calls(content)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["function"]["name"], "code_review")
+        self.assertEqual(calls[0]["function"]["name"], "code_search")
 
     def test_code_comment_nested_comments_array(self) -> None:
         content = json.dumps(
@@ -240,6 +240,80 @@ class ExtractToolCallsTest(unittest.TestCase):
         args = json.loads(tc["function"]["arguments"])
         self.assertEqual(args["path"], "scripts/wait-for-http.sh")
         self.assertIn("API_KEY=", args["comments"][0].get("existing_code", ""))
+        self.assertIsNone(choice["message"]["content"])
+
+    def test_slash_task_done_promoted(self) -> None:
+        for text in ("/task_done", "task_done", "Task Done", "\\task_done"):
+            with self.subTest(text=text):
+                calls = proxy.extract_tool_calls(text)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["function"]["name"], "task_done")
+                self.assertEqual(
+                    json.loads(calls[0]["function"]["arguments"]),
+                    {"state": "DONE"},
+                )
+
+    def test_alias_code_review_current_file_to_file_read(self) -> None:
+        req = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "<current_file_path>scripts/wait-for-http.sh</current_file_path>"
+                    ),
+                }
+            ]
+        }
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "code_review_current_file",
+                                    "arguments": json.dumps(
+                                        {
+                                            "path": "scripts/wait-for-http.sh",
+                                            "diff": "<current_file_diff>",
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        out = proxy.promote_chat_completion(payload, req)
+        tc = out["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(tc["function"]["name"], "file_read")
+        args = json.loads(tc["function"]["arguments"])
+        self.assertEqual(args["file_path"], "scripts/wait-for-http.sh")
+        self.assertNotIn("diff", args)
+        self.assertNotIn("path", args)
+
+    def test_promote_slash_task_done_content(self) -> None:
+        out = proxy.promote_chat_completion(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "/task_done"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+        choice = out["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(
+            choice["message"]["tool_calls"][0]["function"]["name"], "task_done"
+        )
         self.assertIsNone(choice["message"]["content"])
 
     def test_clears_leftover_tool_json_and_dangling_tag(self) -> None:

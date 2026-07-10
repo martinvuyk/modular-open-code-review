@@ -49,6 +49,37 @@ PATH_PLACEHOLDERS = frozenset(
 )
 PATH_ARG_KEYS = frozenset({"file_path", "path", "filepath", "file"})
 
+# Hallucinated / alternate names → OCR tools.
+TOOL_NAME_ALIASES = {
+    "code_review_current_file": "file_read",
+    "code_review": "file_read",
+    "review_file": "file_read",
+    "review_current_file": "file_read",
+    "read_file": "file_read",
+    "read_current_file": "file_read",
+    "submit_comment": "code_comment",
+    "add_comment": "code_comment",
+    "post_comment": "code_comment",
+    "done": "task_done",
+    "finish": "task_done",
+    "complete": "task_done",
+}
+
+DIFF_PLACEHOLDERS = frozenset(
+    {
+        "<current_file_diff>",
+        "</current_file_diff>",
+        "<current_file_diff></current_file_diff>",
+        "current_file_diff",
+        "<current_file_diff/>",
+    }
+)
+
+TASK_DONE_LINE_RE = re.compile(
+    r"^[/\\\s]*(task[\s_-]*done)[/\\\s]*$",
+    re.IGNORECASE,
+)
+
 # Weak models write markdown review essays instead of calling code_comment.
 REVIEW_PROSE_MARKERS = (
     "potential issues",
@@ -158,27 +189,54 @@ def _parse_tool_call_payload(data: Any) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_tool_name(name: str) -> str:
+    cleaned = name.strip().lstrip("/").strip()
+    lower = cleaned.lower().replace("-", "_").replace(" ", "_")
+    if TASK_DONE_LINE_RE.match(cleaned) or lower in {"task_done", "taskdone"}:
+        return "task_done"
+    return TOOL_NAME_ALIASES.get(lower, cleaned)
+
+
 def _normalize_tool_args(name: str, args: Any) -> Any:
-    if name != "task_done":
+    if name == "task_done":
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                return {"state": "DONE"}
+        if not isinstance(args, dict):
+            return {"state": "DONE"}
+        if not args:
+            return {"state": "DONE"}
+        if "state" not in args:
+            return {**args, "state": "DONE"}
         return args
+
     if isinstance(args, str):
         try:
             args = json.loads(args)
         except json.JSONDecodeError:
-            return {"state": "DONE"}
+            return args
     if not isinstance(args, dict):
-        return {"state": "DONE"}
-    if not args:
-        return {"state": "DONE"}
-    if "state" not in args:
-        return {**args, "state": "DONE"}
-    return args
+        return args
+
+    out = dict(args)
+    # file_read expects file_path; models often pass path=.
+    if name == "file_read" and "file_path" not in out and isinstance(out.get("path"), str):
+        out["file_path"] = out.pop("path")
+    # Drop OCR prompt-tag placeholders that are not real diffs/paths.
+    for key in list(out.keys()):
+        val = out[key]
+        if isinstance(val, str) and val.strip() in DIFF_PLACEHOLDERS:
+            del out[key]
+    return out
 
 
 def _make_tool_call(data: dict[str, Any]) -> dict[str, Any]:
     name = data.get("name")
     if not name or not isinstance(name, str):
         raise ValueError("tool call missing name")
+    name = _normalize_tool_name(name)
     args = data.get("arguments", data.get("parameters", {}))
     args = _normalize_tool_args(name, args)
     if isinstance(args, str):
@@ -237,8 +295,8 @@ def extract_tool_calls(content: str) -> list[dict[str, Any]]:
             if payload:
                 _append_tool_call(calls, seen, payload)
 
-    stripped = _strip_markdown_fences(content)
-    if not calls and stripped in {"task_done", "Task done", "TASK_DONE"}:
+    stripped = _strip_markdown_fences(content).strip()
+    if not calls and TASK_DONE_LINE_RE.match(stripped):
         _append_tool_call(calls, seen, {"name": "task_done", "arguments": {"state": "DONE"}})
 
     return calls
@@ -346,21 +404,44 @@ def rewrite_tool_calls(
         if not isinstance(fn, dict):
             out.append(tc)
             continue
+        name = fn.get("name")
+        new_name = _normalize_tool_name(name) if isinstance(name, str) else name
         args = fn.get("arguments", {})
-        new_args, changed = _rewrite_args_placeholders(args, current_path)
-        if not changed:
+        new_args, args_changed = _rewrite_args_placeholders(args, current_path)
+        # Also normalize args for aliased tools (path→file_path, drop diff tags).
+        if isinstance(new_name, str):
+            if isinstance(new_args, str):
+                try:
+                    parsed_args = json.loads(new_args)
+                except json.JSONDecodeError:
+                    parsed_args = new_args
+            else:
+                parsed_args = new_args
+            normalized = _normalize_tool_args(new_name, parsed_args)
+            if normalized != parsed_args:
+                args_changed = True
+                new_args = normalized
+        name_changed = isinstance(name, str) and new_name != name
+        if not args_changed and not name_changed:
             out.append(tc)
             continue
         changed_any = True
         new_fn = dict(fn)
-        if isinstance(new_args, str):
-            new_fn["arguments"] = new_args
-        else:
-            new_fn["arguments"] = json.dumps(new_args, ensure_ascii=False)
+        if name_changed:
+            new_fn["name"] = new_name
+        if args_changed:
+            if isinstance(new_args, str):
+                new_fn["arguments"] = new_args
+            else:
+                new_fn["arguments"] = json.dumps(new_args, ensure_ascii=False)
         new_tc = dict(tc)
         new_tc["function"] = new_fn
         out.append(new_tc)
     return out, changed_any
+
+
+def _is_task_done_text(content: str) -> bool:
+    return bool(TASK_DONE_LINE_RE.match(_strip_markdown_fences(content).strip()))
 
 
 def _clean_promoted_content(content: str) -> str | None:
@@ -369,7 +450,7 @@ def _clean_promoted_content(content: str) -> str | None:
     # Dangling open/close tags from truncated model output.
     cleaned = re.sub(r"</?tool_call>", "", cleaned, flags=re.IGNORECASE)
     cleaned = _strip_markdown_fences(cleaned.strip())
-    if cleaned in {"", "task_done", "Task done", "TASK_DONE"}:
+    if _is_task_done_text(cleaned) or cleaned == "":
         return None
     # Whole (or leading) JSON tool object — drop it once promoted.
     for candidate in _iter_balanced_json_objects(cleaned):
@@ -379,7 +460,7 @@ def _clean_promoted_content(content: str) -> str | None:
         except json.JSONDecodeError:
             continue
     cleaned = cleaned.strip()
-    if cleaned in {"", "task_done", "Task done", "TASK_DONE"}:
+    if _is_task_done_text(cleaned) or cleaned == "":
         return None
     try:
         if _parse_tool_call_payload(json.loads(_strip_markdown_fences(cleaned))):
@@ -457,9 +538,11 @@ def build_tool_policy_text(current_path: str | None) -> str:
     return (
         f"{TOOL_POLICY_MARKER}\n"
         "## Tool-calling policy (mandatory)\n"
+        "- Allowed tools ONLY: file_read, file_read_diff, code_comment, task_done, "
+        "file_find, code_search. Never invent tools (e.g. code_review_current_file).\n"
         "- No markdown essays. Report issues only via code_comment.\n"
         f"- Paths are repo-relative (`{path}`), never `/{path}` or `<current_file_path>`.\n"
-        "- task_done only after code_comment, or if the diff has no issues.\n"
+        "- Emit task_done (not /task_done) only after code_comment, or if no issues.\n"
         f"- Example: {example}\n"
     )
 
