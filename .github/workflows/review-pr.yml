@@ -263,6 +263,11 @@ jobs:
           ocr config set llm.auth_token "local-max"
           ocr config set llm.model "$LLM_MODEL"
           ocr config set llm.use_anthropic false
+          # Local CPU MAX often needs >5m per completion (Qwen 1.5B essays were
+          # already ~2–4m). OCR's default llm.timeout_sec is 300 → context deadline.
+          if [ -z "${{ inputs.llm_url }}" ]; then
+            ocr config set llm.timeout_sec 900
+          fi
           if [ -n "${LLM_EXTRA_BODY:-}" ]; then
             ocr config set llm.extra_body "$LLM_EXTRA_BODY"
           fi
@@ -309,10 +314,16 @@ jobs:
           # discarding it; "Evaluate review outcome" decides whether to publish
           # a PR comment and whether the job should fail.
           set +e
+          REVIEW_TIMEOUT_MIN=15
+          if [ -z "${{ inputs.llm_url }}" ]; then
+            # Per-file wall clock (minutes). Must cover several slow CPU completions.
+            REVIEW_TIMEOUT_MIN=25
+          fi
           ocr review \
             --from "$BASE_REF" \
             --to "$HEAD_SHA" \
             --format json \
+            --timeout "$REVIEW_TIMEOUT_MIN" \
             --concurrency "${{ steps.max.outputs.served_concurrency || steps.preflight.outputs.ocr_concurrency }}" \
             > /tmp/ocr-result-raw.json 2>/tmp/ocr-stderr.log
           rc=$?

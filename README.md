@@ -159,6 +159,7 @@ This workflow uses `pull_request_target` so secrets and cache are available for 
 | Cache miss on PR | Ensure index workflow ran on the current base branch SHA |
 | Review skipped | PR diff estimate exceeded `max_estimated_tokens` |
 | `max serve` timeout | First CPU cold start can take 20+ minutes (download + compile). Check job log for `tail /tmp/max-serve.log`. Run the MAX cache warmer on `main` so later PRs restore caches. |
+| LLM `context deadline exceeded` | OCR’s default per-request HTTP timeout is **300s**. Local CPU Qwen often needs longer; the workflow sets `llm.timeout_sec=900` and `--timeout 25` (minutes per file) when using local MAX. |
 
 ## MAX model cache
 
