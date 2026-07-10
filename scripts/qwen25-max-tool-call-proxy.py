@@ -448,34 +448,19 @@ def prose_to_code_comment(
 
 def build_tool_policy_text(current_path: str | None) -> str:
     path = current_path or "path/to/file.ext"
-    example = {
-        "name": "code_comment",
-        "arguments": {
-            "path": path,
-            "comments": [
-                {
-                    "content": "Hardcoded secret leaked to logs.",
-                    "existing_code": 'API_KEY="sk-..."',
-                    "category": "security",
-                    "severity": "high",
-                }
-            ],
-        },
-    }
-    example_json = json.dumps(example, ensure_ascii=False)
+    # Keep this short: every token slows CPU decode and risks OCR's HTTP deadline.
+    example = (
+        f'<tool_call>{{"name":"code_comment","arguments":{{"path":"{path}",'
+        f'"comments":[{{"content":"Hardcoded secret.","existing_code":"API_KEY=...",'
+        f'"category":"security","severity":"high"}}]}}}}</tool_call>'
+    )
     return (
         f"{TOOL_POLICY_MARKER}\n"
         "## Tool-calling policy (mandatory)\n"
-        "- Do NOT write markdown reviews, analyses, or essays.\n"
-        "- Findings must be reported ONLY by calling the code_comment tool.\n"
-        "- file_path/path values are repo-relative "
-        f"(e.g. `{path}`), never absolute (`/{path}`).\n"
-        "- Never copy prompt tags like `<current_file_path>` into tool args.\n"
-        "- Call task_done ONLY after all issues are filed via code_comment, "
-        "or when the diff truly has no issues.\n"
-        "- Prefer native tool_calls. Hermes text is also accepted:\n"
-        f"<tool_call>\n{example_json}\n</tool_call>\n"
-        "- Bare JSON with the same shape is also accepted.\n"
+        "- No markdown essays. Report issues only via code_comment.\n"
+        f"- Paths are repo-relative (`{path}`), never `/{path}` or `<current_file_path>`.\n"
+        "- task_done only after code_comment, or if the diff has no issues.\n"
+        f"- Example: {example}\n"
     )
 
 
