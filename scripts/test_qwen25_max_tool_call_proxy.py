@@ -199,6 +199,49 @@ class ExtractToolCallsTest(unittest.TestCase):
         )
         self.assertEqual(args["file_path"], "scripts/wait-for-http.sh")
 
+    def test_promote_review_prose_to_code_comment(self) -> None:
+        essay = (
+            "### Analysis of Changes in `scripts/wait-for-http.sh`\n\n"
+            "#### Potential Issues and Suggestions:\n\n"
+            "1. **Security Concerns**:\n"
+            "    - The API key assignment directly in the script might expose the secret key.\n"
+            "```bash\n"
+            'API_KEY="sk-proj-9dF2aQx7bR4tYw8kZ1vN3mP6sL0hG5jU2cE"\n'
+            "```\n"
+            "2. **Suggested Fix**: use an environment variable instead.\n"
+        )
+        # Pad to clear the length threshold.
+        essay = essay + ("More review detail. " * 20)
+        req = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "<current_file_path>scripts/wait-for-http.sh</current_file_path>"
+                    ),
+                }
+            ]
+        }
+        out = proxy.promote_chat_completion(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": essay},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            req,
+        )
+        choice = out["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        tc = choice["message"]["tool_calls"][0]
+        self.assertEqual(tc["function"]["name"], "code_comment")
+        args = json.loads(tc["function"]["arguments"])
+        self.assertEqual(args["path"], "scripts/wait-for-http.sh")
+        self.assertIn("API_KEY=", args["comments"][0].get("existing_code", ""))
+        self.assertIsNone(choice["message"]["content"])
+
     def test_clears_leftover_tool_json_and_dangling_tag(self) -> None:
         content = (
             '{"name": "file_read", "arguments": {"file_path": "scripts/wait-for-http.sh", '
@@ -217,6 +260,53 @@ class ExtractToolCallsTest(unittest.TestCase):
         msg = out["choices"][0]["message"]
         self.assertEqual(len(msg["tool_calls"]), 1)
         self.assertIsNone(msg["content"])
+
+    def test_rewrite_chat_request_injects_policy_once(self) -> None:
+        req = {
+            "messages": [
+                {"role": "system", "content": "You are a reviewer."},
+                {
+                    "role": "user",
+                    "content": (
+                        "<current_file_path>scripts/wait-for-http.sh</current_file_path>\n"
+                        "review the diff"
+                    ),
+                },
+            ]
+        }
+        out, changed = proxy.rewrite_chat_request(req)
+        self.assertTrue(changed)
+        system = out["messages"][0]["content"]
+        self.assertIn(proxy.TOOL_POLICY_MARKER, system)
+        self.assertIn("scripts/wait-for-http.sh", system)
+        self.assertIn("<tool_call>", system)
+        out2, changed2 = proxy.rewrite_chat_request(out)
+        self.assertFalse(changed2)
+
+    def test_rewrite_empty_tool_nudge_after_prose(self) -> None:
+        essay = (
+            "### Analysis\n\n#### Potential Issues and Suggestions:\n\n"
+            "1. **Security Concerns**: hardcoded API_KEY.\n"
+        ) + ("detail " * 80)
+        req = {
+            "messages": [
+                {"role": "system", "content": "base"},
+                {
+                    "role": "user",
+                    "content": (
+                        "<current_file_path>scripts/wait-for-http.sh</current_file_path>"
+                    ),
+                },
+                {"role": "assistant", "content": essay},
+                {"role": "user", "content": proxy.OCR_EMPTY_TOOL_NUDGE},
+            ]
+        }
+        out, changed = proxy.rewrite_chat_request(req)
+        self.assertTrue(changed)
+        nudge = out["messages"][-1]["content"]
+        self.assertIn(proxy.STRONG_EMPTY_TOOL_NUDGE, nudge)
+        self.assertNotIn(proxy.OCR_EMPTY_TOOL_NUDGE, nudge)
+        self.assertIn("prose review", nudge)
 
 
 if __name__ == "__main__":
