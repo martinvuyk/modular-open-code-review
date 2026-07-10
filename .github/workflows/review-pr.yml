@@ -552,7 +552,7 @@ jobs:
               echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls. For Qwen2.5 on local MAX, check the Qwen2.5 tool-call proxy in the job summary."
               ;;
             review_item_failed)
-              echo "::error::Failing job: OCR marked one or more files as review_item_failed (agent did not finish). See session artifact — often a bad tool arg like file_path=<current_file_path>."
+              echo "::error::Failing job: OCR marked one or more files as review_item_failed (agent did not finish). Common causes: hallucinated tools (code_review_current_file), /task_done text instead of a tool call, or bad file_path."
               ;;
             tool_errors_no_comments)
               echo "::error::Failing job: OCR tools failed during review and no comments were produced (often a bad file_path like /scripts/...). See OCR stderr / session artifact."
