@@ -396,14 +396,20 @@ jobs:
               failed_items=$(jq -s '[.[] | select(.type=="review_item_failed")] | length' "$jsonl" 2>/dev/null || echo 0)
               done_items=$(jq -s '[.[] | select(.type=="review_item_done")] | length' "$jsonl" 2>/dev/null || echo 0)
               tool_errors=$(jq -s '[.[] | select(.type=="llm_request") | .messages[]? | select(.role=="tool") | select((.content|tostring)|test("Error executing tool"))] | length' "$jsonl" 2>/dev/null || echo 0)
+              prose_no_tools=$(jq -s '[.[] | select(.type=="llm_response") | select(((.tool_calls // []) | length) == 0) | select(((.content // "") | tostring | length) >= 350)] | length' "$jsonl" 2>/dev/null || echo 0)
+              code_comments=$(jq -s '[.[] | select(.type=="llm_response") | .tool_calls[]? | select(.name=="code_comment")] | length' "$jsonl" 2>/dev/null || echo 0)
               session_tools=$(echo "$session_tools" | tr -d '\n\r' | head -c 20)
               failed_items=$(echo "$failed_items" | tr -d '\n\r' | head -c 20)
               done_items=$(echo "$done_items" | tr -d '\n\r' | head -c 20)
               tool_errors=$(echo "$tool_errors" | tr -d '\n\r' | head -c 20)
+              prose_no_tools=$(echo "$prose_no_tools" | tr -d '\n\r' | head -c 20)
+              code_comments=$(echo "$code_comments" | tr -d '\n\r' | head -c 20)
               echo "session_tool_executions=${session_tools:-0}" >> "$GITHUB_OUTPUT"
               echo "session_failed_items=${failed_items:-0}" >> "$GITHUB_OUTPUT"
               echo "session_done_items=${done_items:-0}" >> "$GITHUB_OUTPUT"
               echo "session_tool_errors=${tool_errors:-0}" >> "$GITHUB_OUTPUT"
+              echo "session_prose_no_tools=${prose_no_tools:-0}" >> "$GITHUB_OUTPUT"
+              echo "session_code_comments=${code_comments:-0}" >> "$GITHUB_OUTPUT"
               cp "$jsonl" /tmp/ocr-session.jsonl
               echo "ocr_session_path=/tmp/ocr-session.jsonl" >> "$GITHUB_OUTPUT"
             else
@@ -431,6 +437,8 @@ jobs:
           failed_items="${{ steps.review.outputs.session_failed_items }}"
           done_items="${{ steps.review.outputs.session_done_items }}"
           tool_errors="${{ steps.review.outputs.session_tool_errors }}"
+          prose_no_tools="${{ steps.review.outputs.session_prose_no_tools }}"
+          code_comments="${{ steps.review.outputs.session_code_comments }}"
           files="${{ steps.review.outputs.files_reviewed }}"
           comments="${{ steps.review.outputs.comments_count }}"
 
@@ -438,6 +446,8 @@ jobs:
           if [ -z "$failed_items" ]; then failed_items=0; fi
           if [ -z "$done_items" ]; then done_items=0; fi
           if [ -z "$tool_errors" ]; then tool_errors=0; fi
+          if [ -z "$prose_no_tools" ]; then prose_no_tools=0; fi
+          if [ -z "$code_comments" ]; then code_comments=0; fi
           if [ -z "$comments" ]; then comments=0; fi
           effective_tools="${tool_total:-0}"
           if [ "$session_tools" -gt "$effective_tools" ]; then
@@ -463,6 +473,12 @@ jobs:
             # e.g. file_read used /scripts/foo.sh, failed, then task_done → false LGTM.
             fail=true
             reason="tool_errors_no_comments"
+            publish=false
+          elif [ "$prose_no_tools" -gt 0 ] && [ "$comments" = "0" ] \
+            && [ "$code_comments" = "0" ]; then
+            # Model wrote a markdown essay, never called code_comment, then task_done.
+            fail=true
+            reason="prose_no_code_comment"
             publish=false
           elif [ -n "$files" ] && [ "$files" != "0" ] && [ "$done_items" = "0" ] \
             && [ -s /tmp/ocr-session.jsonl ]; then
@@ -527,6 +543,9 @@ jobs:
             tool_errors_no_comments)
               echo "::error::Failing job: OCR tools failed during review and no comments were produced (often a bad file_path like /scripts/...). See OCR stderr / session artifact."
               ;;
+            prose_no_code_comment)
+              echo "::error::Failing job: model wrote a review essay instead of calling code_comment, then finished with 0 comments (false LGTM). See session artifact; consider a stronger model."
+              ;;
             incomplete_review)
               echo "::error::Failing job: OCR reviewed files but none completed successfully (no review_item_done). See session artifact."
               ;;
@@ -558,7 +577,7 @@ jobs:
             echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
             echo "- Review status: ${{ steps.review.outputs.review_status || 'n/a' }}"
             echo "- Comments: ${{ steps.review.outputs.comments_count || 'n/a' }} / Warnings: ${{ steps.review.outputs.warnings_count || 'n/a' }}"
-            echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }} (session: ${{ steps.review.outputs.session_tool_executions || 'n/a' }}, done: ${{ steps.review.outputs.session_done_items || 'n/a' }}, failed: ${{ steps.review.outputs.session_failed_items || 'n/a' }}, tool_errors: ${{ steps.review.outputs.session_tool_errors || 'n/a' }})"
+            echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }} (session: ${{ steps.review.outputs.session_tool_executions || 'n/a' }}, done: ${{ steps.review.outputs.session_done_items || 'n/a' }}, failed: ${{ steps.review.outputs.session_failed_items || 'n/a' }}, tool_errors: ${{ steps.review.outputs.session_tool_errors || 'n/a' }}, prose: ${{ steps.review.outputs.session_prose_no_tools || 'n/a' }}, code_comment: ${{ steps.review.outputs.session_code_comments || 'n/a' }})"
             echo "- Qwen2.5 MAX tool-call proxy: ${{ steps.max.outputs.qwen25_max_tool_call_proxy || 'n/a' }}"
             echo "- OCR session: ${{ steps.review.outputs.ocr_session_id || 'n/a' }}"
             echo "- Review exit code: ${{ steps.review.outputs.ocr_exit_code || 'n/a' }}"

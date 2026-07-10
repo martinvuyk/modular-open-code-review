@@ -7,9 +7,13 @@ text, e.g.::
     <tool_call>{"name": "file_read", "arguments": {...}}</tool_call>
 
 or a bare ``task_done`` line. OCR only acts on structured ``tool_calls`` in the
-API response. This proxy forwards to MAX and rewrites non-streaming chat
-completion responses when ``tool_calls`` is empty but the content looks like
-a Qwen2.5 Hermes tool call.
+API response. This proxy:
+
+1. Rewrites outbound chat requests (tool-use policy + few-shot; stronger
+   empty-tool nudge than OCR's default).
+2. Forwards to MAX and rewrites non-streaming responses when ``tool_calls``
+   is empty but the content looks like a Hermes/JSON tool call, or when the
+   model dumps a review essay (promoted to ``code_comment``).
 """
 from __future__ import annotations
 
@@ -44,6 +48,35 @@ PATH_PLACEHOLDERS = frozenset(
     }
 )
 PATH_ARG_KEYS = frozenset({"file_path", "path", "filepath", "file"})
+
+# Weak models write markdown review essays instead of calling code_comment.
+REVIEW_PROSE_MARKERS = (
+    "potential issues",
+    "security concern",
+    "suggested fix",
+    "line-by-line",
+    "### analysis",
+    "## analysis",
+    "hardcoded",
+    "api_key",
+    "secret key",
+    "command injection",
+)
+MIN_REVIEW_PROSE_CHARS = 350
+MAX_PROMOTED_COMMENT_CHARS = 3500
+
+# Injected once per conversation; marker prevents double-injection on retries.
+TOOL_POLICY_MARKER = "<!-- qwen25-max-tool-policy -->"
+OCR_EMPTY_TOOL_NUDGE = (
+    "You did not successfully call any tools. "
+    "Please try again or use task_done if finished."
+)
+STRONG_EMPTY_TOOL_NUDGE = (
+    "You did not call any tools. Do NOT write a markdown analysis or essay. "
+    "If you found issues in the diff, call code_comment now with path set to the "
+    "current file and comments[].existing_code copied from the diff. "
+    "Call task_done ONLY if there are truly no issues. Prose reviews are invalid."
+)
 
 UPSTREAM = "http://127.0.0.1:8000"
 LOG_PREFIX = "[qwen25-max-tool-call-proxy]"
@@ -356,6 +389,206 @@ def _clean_promoted_content(content: str) -> str | None:
     return cleaned or None
 
 
+def looks_like_review_prose(content: str) -> bool:
+    """True when the model wrote a review essay instead of calling tools."""
+    stripped = content.strip()
+    if len(stripped) < MIN_REVIEW_PROSE_CHARS:
+        return False
+    # Already a tool payload — leave to extract_tool_calls.
+    if stripped.startswith("{") and '"name"' in stripped[:200]:
+        return False
+    if "<tool_call>" in stripped.lower():
+        return False
+    lower = stripped.lower()
+    return any(marker in lower for marker in REVIEW_PROSE_MARKERS)
+
+
+def _existing_code_hint(content: str) -> str | None:
+    """Best-effort snippet for OCR line resolution from prose/code fences."""
+    fence = re.search(r"```(?:bash|sh|shell)?\s*\n(.*?)```", content, re.DOTALL)
+    if fence:
+        snippet = fence.group(1).strip()
+        if snippet:
+            return snippet.splitlines()[0][:200]
+    for line in content.splitlines():
+        s = line.strip()
+        if "API_KEY=" in s or "eval " in s or "SECONDS >" in s or "curl -k" in s:
+            # Strip markdown bullets / bold wrappers.
+            s = re.sub(r"^[*`-]+\s*", "", s)
+            s = s.strip("`")
+            if s:
+                return s[:200]
+    return None
+
+
+def prose_to_code_comment(
+    content: str, current_path: str | None
+) -> dict[str, Any] | None:
+    """Wrap a review essay as a structured code_comment tool call for OCR."""
+    if not current_path or not looks_like_review_prose(content):
+        return None
+    body = content.strip()
+    if len(body) > MAX_PROMOTED_COMMENT_CHARS:
+        body = body[: MAX_PROMOTED_COMMENT_CHARS - 20].rstrip() + "\n…(truncated)"
+    comment: dict[str, Any] = {
+        "content": (
+            "[Promoted from model prose — call `code_comment` next time.]\n\n" + body
+        ),
+        "category": "maintainability",
+        "severity": "medium",
+    }
+    hint = _existing_code_hint(content)
+    if hint:
+        comment["existing_code"] = hint
+    return {
+        "name": "code_comment",
+        "arguments": {"path": current_path, "comments": [comment]},
+    }
+
+
+def build_tool_policy_text(current_path: str | None) -> str:
+    path = current_path or "path/to/file.ext"
+    example = {
+        "name": "code_comment",
+        "arguments": {
+            "path": path,
+            "comments": [
+                {
+                    "content": "Hardcoded secret leaked to logs.",
+                    "existing_code": 'API_KEY="sk-..."',
+                    "category": "security",
+                    "severity": "high",
+                }
+            ],
+        },
+    }
+    example_json = json.dumps(example, ensure_ascii=False)
+    return (
+        f"{TOOL_POLICY_MARKER}\n"
+        "## Tool-calling policy (mandatory)\n"
+        "- Do NOT write markdown reviews, analyses, or essays.\n"
+        "- Findings must be reported ONLY by calling the code_comment tool.\n"
+        "- file_path/path values are repo-relative "
+        f"(e.g. `{path}`), never absolute (`/{path}`).\n"
+        "- Never copy prompt tags like `<current_file_path>` into tool args.\n"
+        "- Call task_done ONLY after all issues are filed via code_comment, "
+        "or when the diff truly has no issues.\n"
+        "- Prefer native tool_calls. Hermes text is also accepted:\n"
+        f"<tool_call>\n{example_json}\n</tool_call>\n"
+        "- Bare JSON with the same shape is also accepted.\n"
+    )
+
+
+def _message_text(msg: dict[str, Any]) -> str:
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+    return ""
+
+
+def _set_message_text(msg: dict[str, Any], text: str) -> dict[str, Any]:
+    out = dict(msg)
+    content = msg.get("content")
+    if isinstance(content, list):
+        out["content"] = [{"type": "text", "text": text}]
+    else:
+        out["content"] = text
+    return out
+
+
+def _conversation_has_policy(messages: list[Any]) -> bool:
+    for msg in messages:
+        if isinstance(msg, dict) and TOOL_POLICY_MARKER in _message_text(msg):
+            return True
+    return False
+
+
+def _last_assistant_was_prose(messages: list[Any]) -> bool:
+    for msg in reversed(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        if msg.get("tool_calls"):
+            return False
+        return looks_like_review_prose(_message_text(msg))
+    return False
+
+
+def rewrite_chat_request(req_payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Inject tool policy + rewrite OCR's weak empty-tool nudge."""
+    messages = req_payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return req_payload, False
+
+    changed = False
+    current_path = extract_current_file_path(req_payload)
+    new_messages: list[Any] = list(messages)
+
+    if not _conversation_has_policy(new_messages):
+        policy = build_tool_policy_text(current_path)
+        inserted = False
+        for i, msg in enumerate(new_messages):
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                existing = _message_text(msg)
+                new_messages[i] = _set_message_text(
+                    msg, existing.rstrip() + "\n\n" + policy
+                )
+                inserted = True
+                break
+        if not inserted:
+            new_messages.insert(0, {"role": "system", "content": policy})
+        changed = True
+
+    prose_escape = _last_assistant_was_prose(new_messages)
+    for i, msg in enumerate(new_messages):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        text = _message_text(msg)
+        if OCR_EMPTY_TOOL_NUDGE not in text:
+            continue
+        if STRONG_EMPTY_TOOL_NUDGE in text:
+            continue
+        replaced = text.replace(OCR_EMPTY_TOOL_NUDGE, STRONG_EMPTY_TOOL_NUDGE)
+        if prose_escape:
+            replaced += (
+                " Your previous message was a prose review; convert each "
+                "finding into code_comment tool calls now."
+            )
+        new_messages[i] = _set_message_text(msg, replaced)
+        changed = True
+
+    if not changed:
+        return req_payload, False
+    out = dict(req_payload)
+    out["messages"] = new_messages
+    return out, True
+
+
+def _maybe_rewrite_request_body(method: str, path: str, body: bytes) -> bytes:
+    if method != "POST" or not path.rstrip("/").endswith("/chat/completions") or not body:
+        return body
+    try:
+        req_payload = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(req_payload, dict) or req_payload.get("stream"):
+        return body
+    rewritten, changed = rewrite_chat_request(req_payload)
+    if not changed:
+        return body
+    sys.stderr.write(f"{LOG_PREFIX} rewrote chat request (tool policy / nudge)\n")
+    return json.dumps(rewritten, ensure_ascii=False).encode("utf-8")
+
+
 def promote_message(
     message: dict[str, Any], current_path: str | None = None
 ) -> dict[str, Any]:
@@ -386,7 +619,16 @@ def promote_message(
         return message
     tool_calls = extract_tool_calls(content)
     if not tool_calls:
-        return message
+        # Qwen2.5-1.5B often dumps a markdown review instead of code_comment.
+        prose_call = prose_to_code_comment(content, current_path)
+        if prose_call is None:
+            return message
+        tool_calls = []
+        _append_tool_call(tool_calls, set(), prose_call)
+        promoted = dict(message)
+        promoted["tool_calls"] = tool_calls
+        promoted["content"] = None
+        return promoted
     tool_calls, _ = rewrite_tool_calls(tool_calls, current_path)
     promoted = dict(message)
     promoted["tool_calls"] = tool_calls
@@ -530,6 +772,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         body = self._read_body() if method == "POST" else b""
+        body = _maybe_rewrite_request_body(method, path, body)
         try:
             status, resp_headers, raw = _forward_upstream(
                 method, path, body, self._client_headers()
