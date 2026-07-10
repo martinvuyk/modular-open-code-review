@@ -313,6 +313,32 @@ def rewrite_tool_calls(
     return out, changed_any
 
 
+def _clean_promoted_content(content: str) -> str | None:
+    """Remove tool-call text left in content after promotion."""
+    cleaned = TOOL_CALL_BLOCK_RE.sub("", content)
+    # Dangling open/close tags from truncated model output.
+    cleaned = re.sub(r"</?tool_call>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = _strip_markdown_fences(cleaned.strip())
+    if cleaned in {"", "task_done", "Task done", "TASK_DONE"}:
+        return None
+    # Whole (or leading) JSON tool object — drop it once promoted.
+    for candidate in _iter_balanced_json_objects(cleaned):
+        try:
+            if _parse_tool_call_payload(json.loads(candidate)):
+                cleaned = cleaned.replace(candidate, "", 1).strip()
+        except json.JSONDecodeError:
+            continue
+    cleaned = cleaned.strip()
+    if cleaned in {"", "task_done", "Task done", "TASK_DONE"}:
+        return None
+    try:
+        if _parse_tool_call_payload(json.loads(_strip_markdown_fences(cleaned))):
+            return None
+    except json.JSONDecodeError:
+        pass
+    return cleaned or None
+
+
 def promote_message(
     message: dict[str, Any], current_path: str | None = None
 ) -> dict[str, Any]:
@@ -321,10 +347,21 @@ def promote_message(
         rewritten, changed = rewrite_tool_calls(
             existing if isinstance(existing, list) else [], current_path
         )
-        if not changed:
+        content = message.get("content")
+        content_changed = False
+        new_content = content
+        if isinstance(content, str) and content.strip():
+            # Model often emits both structured tool_calls AND leftover text
+            # like `{"name":...}\n<tool_call>`.
+            new_content = _clean_promoted_content(content)
+            content_changed = new_content != content
+        if not changed and not content_changed:
             return message
         promoted = dict(message)
-        promoted["tool_calls"] = rewritten
+        if changed:
+            promoted["tool_calls"] = rewritten
+        if content_changed:
+            promoted["content"] = new_content
         return promoted
 
     content = message.get("content")
@@ -336,18 +373,7 @@ def promote_message(
     tool_calls, _ = rewrite_tool_calls(tool_calls, current_path)
     promoted = dict(message)
     promoted["tool_calls"] = tool_calls
-    cleaned = TOOL_CALL_BLOCK_RE.sub("", content).strip()
-    cleaned = _strip_markdown_fences(cleaned)
-    if cleaned in {"", "task_done", "Task done", "TASK_DONE"}:
-        promoted["content"] = None
-    else:
-        try:
-            if _parse_tool_call_payload(json.loads(_strip_markdown_fences(cleaned))):
-                promoted["content"] = None
-            else:
-                promoted["content"] = cleaned or None
-        except json.JSONDecodeError:
-            promoted["content"] = cleaned or None
+    promoted["content"] = _clean_promoted_content(content)
     return promoted
 
 
