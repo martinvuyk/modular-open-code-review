@@ -29,6 +29,21 @@ TOOL_CALL_BLOCK_RE = re.compile(
 MARKDOWN_FENCE_RE = re.compile(
     r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE
 )
+CURRENT_FILE_PATH_RE = re.compile(
+    r"<current_file_path>\s*(.*?)\s*</current_file_path>",
+    re.DOTALL | re.IGNORECASE,
+)
+# Weak models often copy OCR prompt tags literally into tool args.
+PATH_PLACEHOLDERS = frozenset(
+    {
+        "<current_file_path>",
+        "</current_file_path>",
+        "<current_file_path></current_file_path>",
+        "current_file_path",
+        "<current_file_path/>",
+    }
+)
+PATH_ARG_KEYS = frozenset({"file_path", "path", "filepath", "file"})
 
 UPSTREAM = "http://127.0.0.1:8000"
 LOG_PREFIX = "[qwen25-max-tool-call-proxy]"
@@ -196,15 +211,129 @@ def extract_tool_calls(content: str) -> list[dict[str, Any]]:
     return calls
 
 
-def promote_message(message: dict[str, Any]) -> dict[str, Any]:
-    if message.get("tool_calls"):
-        return message
+def extract_current_file_path(req_payload: dict[str, Any] | None) -> str | None:
+    """Pull the real path from OCR's <current_file_path>…</current_file_path> tags."""
+    if not req_payload:
+        return None
+    messages = req_payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        match = CURRENT_FILE_PATH_RE.search(content)
+        if match:
+            path = match.group(1).strip()
+            if path and path not in PATH_PLACEHOLDERS:
+                return path
+    return None
+
+
+def _looks_like_path_placeholder(value: str) -> bool:
+    stripped = value.strip()
+    if stripped in PATH_PLACEHOLDERS:
+        return True
+    # Model copied the opening tag name as the path.
+    if stripped in {"<current_file_path>", "current_file_path"}:
+        return True
+    # Empty tag or tag-only string.
+    match = CURRENT_FILE_PATH_RE.fullmatch(stripped)
+    if match is not None and not match.group(1).strip():
+        return True
+    return False
+
+
+def _rewrite_args_placeholders(
+    args: Any, current_path: str | None
+) -> tuple[Any, bool]:
+    """Replace placeholder paths and drop JSON nulls. Returns (args, changed)."""
+    changed = False
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except json.JSONDecodeError:
+            return args, False
+        rewritten, changed = _rewrite_args_placeholders(parsed, current_path)
+        if changed:
+            return json.dumps(rewritten, ensure_ascii=False), True
+        return args, False
+    if not isinstance(args, dict):
+        return args, False
+
+    out: dict[str, Any] = {}
+    for key, value in args.items():
+        if value is None:
+            changed = True
+            continue
+        if (
+            current_path
+            and key in PATH_ARG_KEYS
+            and isinstance(value, str)
+            and _looks_like_path_placeholder(value)
+        ):
+            out[key] = current_path
+            changed = True
+            continue
+        out[key] = value
+    return out, changed
+
+
+def rewrite_tool_calls(
+    tool_calls: list[Any], current_path: str | None
+) -> tuple[list[Any], bool]:
+    if not tool_calls:
+        return tool_calls, False
+    changed_any = False
+    out: list[Any] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            out.append(tc)
+            continue
+        args = fn.get("arguments", {})
+        new_args, changed = _rewrite_args_placeholders(args, current_path)
+        if not changed:
+            out.append(tc)
+            continue
+        changed_any = True
+        new_fn = dict(fn)
+        if isinstance(new_args, str):
+            new_fn["arguments"] = new_args
+        else:
+            new_fn["arguments"] = json.dumps(new_args, ensure_ascii=False)
+        new_tc = dict(tc)
+        new_tc["function"] = new_fn
+        out.append(new_tc)
+    return out, changed_any
+
+
+def promote_message(
+    message: dict[str, Any], current_path: str | None = None
+) -> dict[str, Any]:
+    existing = message.get("tool_calls")
+    if existing:
+        rewritten, changed = rewrite_tool_calls(
+            existing if isinstance(existing, list) else [], current_path
+        )
+        if not changed:
+            return message
+        promoted = dict(message)
+        promoted["tool_calls"] = rewritten
+        return promoted
+
     content = message.get("content")
     if not isinstance(content, str) or not content:
         return message
     tool_calls = extract_tool_calls(content)
     if not tool_calls:
         return message
+    tool_calls, _ = rewrite_tool_calls(tool_calls, current_path)
     promoted = dict(message)
     promoted["tool_calls"] = tool_calls
     cleaned = TOOL_CALL_BLOCK_RE.sub("", content).strip()
@@ -212,17 +341,26 @@ def promote_message(message: dict[str, Any]) -> dict[str, Any]:
     if cleaned in {"", "task_done", "Task done", "TASK_DONE"}:
         promoted["content"] = None
     else:
-        promoted["content"] = cleaned or None
+        try:
+            if _parse_tool_call_payload(json.loads(_strip_markdown_fences(cleaned))):
+                promoted["content"] = None
+            else:
+                promoted["content"] = cleaned or None
+        except json.JSONDecodeError:
+            promoted["content"] = cleaned or None
     return promoted
 
 
-def promote_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
+def promote_chat_completion(
+    payload: dict[str, Any], req_payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
     choices = payload.get("choices")
     if not isinstance(choices, list):
         return payload
+    current_path = extract_current_file_path(req_payload)
     out = dict(payload)
     new_choices = []
-    promoted_any = False
+    changed_any = False
     for choice in choices:
         if not isinstance(choice, dict):
             new_choices.append(choice)
@@ -231,18 +369,18 @@ def promote_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(msg, dict):
             new_choices.append(choice)
             continue
-        promoted = promote_message(msg)
+        promoted = promote_message(msg, current_path)
         if promoted is msg:
             new_choices.append(choice)
         else:
-            promoted_any = True
+            changed_any = True
             new_choice = dict(choice)
             new_choice["message"] = promoted
             if promoted.get("tool_calls"):
                 new_choice["finish_reason"] = "tool_calls"
             new_choices.append(new_choice)
     out["choices"] = new_choices
-    if promoted_any:
+    if changed_any:
         names = []
         for choice in new_choices:
             msg = choice.get("message", {}) if isinstance(choice, dict) else {}
@@ -251,8 +389,9 @@ def promote_chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
                 if fn.get("name"):
                     names.append(fn["name"])
         if names:
+            extra = f" (file_path→{current_path})" if current_path else ""
             sys.stderr.write(
-                f"{LOG_PREFIX} promoted tool_calls: {', '.join(names)}\n"
+                f"{LOG_PREFIX} promoted/rewrote tool_calls: {', '.join(names)}{extra}\n"
             )
     return out
 
@@ -314,7 +453,9 @@ def _maybe_promote_chat_completion(
         return raw
     if req_payload.get("stream") or not isinstance(payload, dict):
         return raw
-    return json.dumps(promote_chat_completion(payload), ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        promote_chat_completion(payload, req_payload), ensure_ascii=False
+    ).encode("utf-8")
 
 
 class ProxyHandler(BaseHTTPRequestHandler):

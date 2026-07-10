@@ -388,9 +388,15 @@ jobs:
                   usage: .usage
                 }' "$jsonl" 2>/dev/null || true
               echo "--- tool executions ---"
-              jq -c 'select(.type=="tool_call") | {tool_name, ok, result: ((.result // "") | tostring | .[0:200])}' "$jsonl" 2>/dev/null || true
-              session_tools=$(jq -c 'select(.type=="tool_call")' "$jsonl" 2>/dev/null | wc -l | tr -d ' ')
+              # OCR logs tool results inside llm_request messages (role=tool), not
+              # as standalone type=tool_call events.
+              jq -c 'select(.type=="llm_response") | .tool_calls[]? | {name, arguments: (.arguments|tostring|.[0:120])}' "$jsonl" 2>/dev/null || true
+              session_tools=$(jq '[select(.type=="llm_response") | .tool_calls[]?] | length' "$jsonl" 2>/dev/null || echo 0)
               echo "session_tool_executions=${session_tools:-0}" >> "$GITHUB_OUTPUT"
+              failed_items=$(jq '[select(.type=="review_item_failed")] | length' "$jsonl" 2>/dev/null || echo 0)
+              done_items=$(jq '[select(.type=="review_item_done")] | length' "$jsonl" 2>/dev/null || echo 0)
+              echo "session_failed_items=${failed_items:-0}" >> "$GITHUB_OUTPUT"
+              echo "session_done_items=${done_items:-0}" >> "$GITHUB_OUTPUT"
               cp "$jsonl" /tmp/ocr-session.jsonl
               echo "ocr_session_path=/tmp/ocr-session.jsonl" >> "$GITHUB_OUTPUT"
             else
@@ -415,9 +421,15 @@ jobs:
           status="${{ steps.review.outputs.review_status }}"
           tool_total="${{ steps.review.outputs.tool_calls_total }}"
           session_tools="${{ steps.review.outputs.session_tool_executions }}"
+          failed_items="${{ steps.review.outputs.session_failed_items }}"
+          done_items="${{ steps.review.outputs.session_done_items }}"
           files="${{ steps.review.outputs.files_reviewed }}"
+          comments="${{ steps.review.outputs.comments_count }}"
 
           if [ -z "$session_tools" ]; then session_tools=0; fi
+          if [ -z "$failed_items" ]; then failed_items=0; fi
+          if [ -z "$done_items" ]; then done_items=0; fi
+          if [ -z "$comments" ]; then comments=0; fi
           effective_tools="${tool_total:-0}"
           if [ "$session_tools" -gt "$effective_tools" ]; then
             effective_tools="$session_tools"
@@ -432,12 +444,32 @@ jobs:
             fail=true
             reason="completed_with_errors"
             publish=false
+          elif [ "$failed_items" -gt 0 ]; then
+            # OCR may still report status=success with 0 comments when the agent
+            # loop times out (review_item_failed: main_task did not complete).
+            fail=true
+            reason="review_item_failed"
+            publish=false
+          elif [ -n "$files" ] && [ "$files" != "0" ] && [ "$done_items" = "0" ] \
+            && [ -s /tmp/ocr-session.jsonl ]; then
+            fail=true
+            reason="incomplete_review"
+            publish=false
           elif [ -z "${{ inputs.llm_url }}" ] \
             && [ "${effective_tools:-0}" = "0" ] \
             && [ -n "$files" ] && [ "$files" != "0" ]; then
             fail=true
             reason="zero_tool_calls"
             publish=false
+          fi
+
+          # Never post a false LGTM when the review did not finish cleanly.
+          # Hard OCR exits still publish so post-review.js can surface stderr.
+          if [ "$fail" = "true" ] && [ "$comments" = "0" ]; then
+            case "$reason" in
+              ocr_exit_*) ;;
+              *) publish=false ;;
+            esac
           fi
 
           echo "publish_comments=${publish}" >> "$GITHUB_OUTPUT"
@@ -458,7 +490,7 @@ jobs:
         if: >-
           inputs.debug_review
           && (steps.review.outputs.ocr_session_path != '' || steps.review.outputs.ocr_session_id != '')
-        uses: actions/upload-artifact@v4.6.0
+        uses: actions/upload-artifact@v5.0.0
         with:
           name: ocr-session-${{ steps.review.outputs.ocr_session_id || github.run_id }}
           path: /tmp/ocr-session.jsonl
@@ -474,6 +506,12 @@ jobs:
               ;;
             zero_tool_calls)
               echo "::error::Failing job: OCR completed but the LLM made zero structured tool calls. For Qwen2.5 on local MAX, check the Qwen2.5 tool-call proxy in the job summary."
+              ;;
+            review_item_failed)
+              echo "::error::Failing job: OCR marked one or more files as review_item_failed (agent did not finish). See session artifact — often a bad tool arg like file_path=<current_file_path>."
+              ;;
+            incomplete_review)
+              echo "::error::Failing job: OCR reviewed files but none completed successfully (no review_item_done). See session artifact."
               ;;
             completed_with_errors)
               echo "::error::Failing job: Open Code Review status=${{ steps.review.outputs.review_status || 'n/a' }}. Some files may not have been reviewed."
@@ -503,7 +541,7 @@ jobs:
             echo "- Skip review: ${{ steps.preflight.outputs.skip_review }}"
             echo "- Review status: ${{ steps.review.outputs.review_status || 'n/a' }}"
             echo "- Comments: ${{ steps.review.outputs.comments_count || 'n/a' }} / Warnings: ${{ steps.review.outputs.warnings_count || 'n/a' }}"
-            echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }} (session executions: ${{ steps.review.outputs.session_tool_executions || 'n/a' }})"
+            echo "- OCR tool calls: ${{ steps.review.outputs.tool_calls_total || 'n/a' }} (session: ${{ steps.review.outputs.session_tool_executions || 'n/a' }}, done: ${{ steps.review.outputs.session_done_items || 'n/a' }}, failed: ${{ steps.review.outputs.session_failed_items || 'n/a' }})"
             echo "- Qwen2.5 MAX tool-call proxy: ${{ steps.max.outputs.qwen25_max_tool_call_proxy || 'n/a' }}"
             echo "- OCR session: ${{ steps.review.outputs.ocr_session_id || 'n/a' }}"
             echo "- Review exit code: ${{ steps.review.outputs.ocr_exit_code || 'n/a' }}"
