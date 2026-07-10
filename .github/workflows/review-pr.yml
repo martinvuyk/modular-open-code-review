@@ -478,11 +478,18 @@ jobs:
             reason="completed_with_errors"
             publish=false
           elif [ "$failed_items" -gt 0 ]; then
-            # OCR may still report status=success with 0 comments when the agent
-            # loop times out (review_item_failed: main_task did not complete).
-            fail=true
-            reason="review_item_failed"
-            publish=false
+            # OCR may still report status=success when the agent never called a
+            # real task_done (e.g. plain-text "(task_done)"). If comments were
+            # already collected, publish them and do not fail the job.
+            if [ "$comments" -gt 0 ]; then
+              publish=true
+              fail=false
+              reason=""
+            else
+              fail=true
+              reason="review_item_failed"
+              publish=false
+            fi
           elif [ "$tool_errors" -gt 0 ] && [ "$comments" = "0" ]; then
             # e.g. file_read used /scripts/foo.sh, failed, then task_done → false LGTM.
             fail=true

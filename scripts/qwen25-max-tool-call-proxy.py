@@ -76,7 +76,8 @@ DIFF_PLACEHOLDERS = frozenset(
 )
 
 TASK_DONE_LINE_RE = re.compile(
-    r"^[/\\\s]*(task[\s_-]*done)[/\\\s]*$",
+    # /task_done, (task_done), [task_done], task_done, Task Done, …
+    r"^[\[\(\{\s/\\]*task[\s_-]*done[\]\)\}\s/\\]*$",
     re.IGNORECASE,
 )
 
@@ -106,6 +107,9 @@ STRONG_EMPTY_TOOL_NUDGE = (
     "You did not call any tools. Do NOT write a markdown analysis or essay. "
     "If you found issues in the diff, call code_comment now with path set to the "
     "current file and comments[].existing_code copied from the diff. "
+    "To finish, emit exactly: "
+    '<tool_call>{"name":"task_done","arguments":{"state":"DONE"}}</tool_call> '
+    "(never /task_done, never (task_done), never prose). "
     "Call task_done ONLY if there are truly no issues. Prose reviews are invalid."
 )
 
@@ -486,20 +490,37 @@ def looks_like_review_prose(content: str) -> bool:
 
 def _existing_code_hint(content: str) -> str | None:
     """Best-effort snippet for OCR line resolution from prose/code fences."""
-    fence = re.search(r"```(?:bash|sh|shell)?\s*\n(.*?)```", content, re.DOTALL)
-    if fence:
-        snippet = fence.group(1).strip()
-        if snippet:
-            return snippet.splitlines()[0][:200]
-    for line in content.splitlines():
-        s = line.strip()
-        if "API_KEY=" in s or "eval " in s or "SECONDS >" in s or "curl -k" in s:
-            # Strip markdown bullets / bold wrappers.
-            s = re.sub(r"^[*`-]+\s*", "", s)
-            s = s.strip("`")
-            if s:
+    code_needles = (
+        "API_KEY=",
+        "while (( SECONDS",
+        'eval "curl',
+        "eval 'curl",
+        "curl -k",
+    )
+
+    def pick_from(text: str) -> str | None:
+        for line in text.splitlines():
+            s = line.strip().lstrip("+").strip()
+            s = re.sub(r"^[*`-]+\s*", "", s).strip("`")
+            # Skip markdown prose that happens to mention eval/curl.
+            if (
+                not s
+                or s.startswith("#")
+                or s.startswith("**")
+                or re.match(r"^\d+\.\s", s)
+            ):
+                continue
+            if any(needle in s for needle in code_needles):
                 return s[:200]
-    return None
+        return None
+
+    for fence in re.finditer(
+        r"```(?:bash|sh|shell|diff)?\s*\n(.*?)```", content, re.DOTALL
+    ):
+        hit = pick_from(fence.group(1))
+        if hit:
+            return hit
+    return pick_from(content)
 
 
 def prose_to_code_comment(
@@ -515,8 +536,12 @@ def prose_to_code_comment(
         "content": (
             "[Promoted from model prose — call `code_comment` next time.]\n\n" + body
         ),
-        "category": "maintainability",
-        "severity": "medium",
+        "category": "security"
+        if any(m in body.lower() for m in ("api_key", "secret", "hardcoded"))
+        else "maintainability",
+        "severity": "high"
+        if any(m in body.lower() for m in ("api_key", "secret", "hardcoded"))
+        else "medium",
     }
     hint = _existing_code_hint(content)
     if hint:
@@ -530,10 +555,13 @@ def prose_to_code_comment(
 def build_tool_policy_text(current_path: str | None) -> str:
     path = current_path or "path/to/file.ext"
     # Keep this short: every token slows CPU decode and risks OCR's HTTP deadline.
-    example = (
+    comment_example = (
         f'<tool_call>{{"name":"code_comment","arguments":{{"path":"{path}",'
         f'"comments":[{{"content":"Hardcoded secret.","existing_code":"API_KEY=...",'
         f'"category":"security","severity":"high"}}]}}}}</tool_call>'
+    )
+    done_example = (
+        '<tool_call>{"name":"task_done","arguments":{"state":"DONE"}}</tool_call>'
     )
     return (
         f"{TOOL_POLICY_MARKER}\n"
@@ -542,8 +570,11 @@ def build_tool_policy_text(current_path: str | None) -> str:
         "file_find, code_search. Never invent tools (e.g. code_review_current_file).\n"
         "- No markdown essays. Report issues only via code_comment.\n"
         f"- Paths are repo-relative (`{path}`), never `/{path}` or `<current_file_path>`.\n"
-        "- Emit task_done (not /task_done) only after code_comment, or if no issues.\n"
-        f"- Example: {example}\n"
+        "- Finish ONLY with this exact tool call (never prose, never /task_done, "
+        "never (task_done)): "
+        f"{done_example}\n"
+        f"- Call task_done only after code_comment, or if there are truly no issues.\n"
+        f"- Example code_comment: {comment_example}\n"
     )
 
 
@@ -692,7 +723,12 @@ def promote_message(
         if prose_call is None:
             return message
         tool_calls = []
-        _append_tool_call(tool_calls, set(), prose_call)
+        seen: set[tuple[str, str]] = set()
+        _append_tool_call(tool_calls, seen, prose_call)
+        # End the OCR loop; otherwise the model emits "(task_done)" text forever.
+        _append_tool_call(
+            tool_calls, seen, {"name": "task_done", "arguments": {"state": "DONE"}}
+        )
         promoted = dict(message)
         promoted["tool_calls"] = tool_calls
         promoted["content"] = None
