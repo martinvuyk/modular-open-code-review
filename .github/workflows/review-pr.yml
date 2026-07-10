@@ -388,13 +388,17 @@ jobs:
                   usage: .usage
                 }' "$jsonl" 2>/dev/null || true
               echo "--- tool executions ---"
-              # OCR logs tool results inside llm_request messages (role=tool), not
-              # as standalone type=tool_call events.
+              # OCR logs tool calls on llm_response events (not type=tool_call).
               jq -c 'select(.type=="llm_response") | .tool_calls[]? | {name, arguments: (.arguments|tostring|.[0:120])}' "$jsonl" 2>/dev/null || true
-              session_tools=$(jq '[select(.type=="llm_response") | .tool_calls[]?] | length' "$jsonl" 2>/dev/null || echo 0)
+              # Must use -s (slurp): without it, jq emits one length per JSONL line
+              # and multiline GITHUB_OUTPUT values fail with "Invalid format '0'".
+              session_tools=$(jq -s '[.[] | select(.type=="llm_response") | .tool_calls[]?] | length' "$jsonl" 2>/dev/null || echo 0)
+              failed_items=$(jq -s '[.[] | select(.type=="review_item_failed")] | length' "$jsonl" 2>/dev/null || echo 0)
+              done_items=$(jq -s '[.[] | select(.type=="review_item_done")] | length' "$jsonl" 2>/dev/null || echo 0)
+              session_tools=$(echo "$session_tools" | tr -d '\n\r' | head -c 20)
+              failed_items=$(echo "$failed_items" | tr -d '\n\r' | head -c 20)
+              done_items=$(echo "$done_items" | tr -d '\n\r' | head -c 20)
               echo "session_tool_executions=${session_tools:-0}" >> "$GITHUB_OUTPUT"
-              failed_items=$(jq '[select(.type=="review_item_failed")] | length' "$jsonl" 2>/dev/null || echo 0)
-              done_items=$(jq '[select(.type=="review_item_done")] | length' "$jsonl" 2>/dev/null || echo 0)
               echo "session_failed_items=${failed_items:-0}" >> "$GITHUB_OUTPUT"
               echo "session_done_items=${done_items:-0}" >> "$GITHUB_OUTPUT"
               cp "$jsonl" /tmp/ocr-session.jsonl

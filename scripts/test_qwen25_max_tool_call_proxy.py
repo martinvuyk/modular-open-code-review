@@ -137,6 +137,25 @@ class ExtractToolCallsTest(unittest.TestCase):
         )
         self.assertEqual(path, "scripts/wait-for-http.sh")
 
+    def test_clears_leftover_tool_json_and_dangling_tag(self) -> None:
+        content = (
+            '{"name": "file_read", "arguments": {"file_path": "scripts/wait-for-http.sh", '
+            '"start_line": 1, "end_line": 5}}\n<tool_call>'
+        )
+        out = proxy.promote_chat_completion(
+            {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+        msg = out["choices"][0]["message"]
+        self.assertEqual(len(msg["tool_calls"]), 1)
+        self.assertIsNone(msg["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
