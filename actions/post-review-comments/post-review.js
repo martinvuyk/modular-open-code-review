@@ -163,8 +163,8 @@ module.exports = async function postReviewComments({ github, context, core }) {
 
   let finalBody = buildSummaryBody(totalCount, successCount, commentsWithoutLine.length + failedComments.length, warnings);
   finalBody += formatSummaryComments(commentsWithoutLine);
-  finalBody += `\n\n---\n\n📊 **Posting Statistics:**\n- ✅ Successfully posted: ${successCount} comment(s)`;
   if (failedCount > 0) {
+    finalBody += `\n\n---\n\n📊 **Posting Statistics:**\n- ✅ Successfully posted: ${successCount} comment(s)`;
     finalBody += `\n- ❌ Failed to post: ${failedCount} comment(s)`;
   }
   if (failedComments.length > 0) {
@@ -173,14 +173,23 @@ module.exports = async function postReviewComments({ github, context, core }) {
       finalBody += '\n\n---\n\n' + formatCommentMarkdown(comment, error);
     }
   }
-  finalBody = SUMMARY_TAG + '\n' + finalBody;
 
-  await github.rest.issues.createComment({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
-    issue_number: prNumber,
-    body: finalBody,
-  });
+  // Skip the extra issue comment when the PR review already carries everything
+  // (all findings posted inline). Only post when something must live in the
+  // conversation thread: unlocated comments or failed inline posts.
+  const needsIssueComment =
+    commentsWithoutLine.length > 0 || failedComments.length > 0;
+  if (needsIssueComment) {
+    finalBody = SUMMARY_TAG + '\n' + finalBody;
+    await github.rest.issues.createComment({
+      owner: context.repo.owner,
+      repo: context.repo.repo,
+      issue_number: prNumber,
+      body: finalBody,
+    });
+  } else {
+    core.info('Skipping redundant issue summary; all findings posted inline');
+  }
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -238,7 +247,9 @@ module.exports = async function postReviewComments({ github, context, core }) {
     let body = `🔍 **OpenCodeReview** found **${total}** issue(s) in this PR.`;
     if (total > 0) {
       body += `\n- ✅ ${inline} posted as inline comment(s)`;
-      body += `\n- 📝 ${summary} posted as summary`;
+      if (summary > 0) {
+        body += `\n- 📝 ${summary} posted as summary`;
+      }
     }
     if (warnings.length > 0) {
       body += `\n\n⚠️ ${warnings.length} warning(s) occurred during review.`;
