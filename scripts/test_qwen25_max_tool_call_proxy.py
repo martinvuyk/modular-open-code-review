@@ -137,6 +137,68 @@ class ExtractToolCallsTest(unittest.TestCase):
         )
         self.assertEqual(path, "scripts/wait-for-http.sh")
 
+    def test_normalize_leading_slash_path(self) -> None:
+        self.assertEqual(
+            proxy._normalize_repo_path(
+                "/scripts/wait-for-http.sh", "scripts/wait-for-http.sh"
+            ),
+            "scripts/wait-for-http.sh",
+        )
+        self.assertEqual(
+            proxy._normalize_repo_path(
+                "./scripts/wait-for-http.sh", "scripts/wait-for-http.sh"
+            ),
+            "scripts/wait-for-http.sh",
+        )
+        # Without current_path, still strip the leading slash.
+        self.assertEqual(
+            proxy._normalize_repo_path("/scripts/wait-for-http.sh", None),
+            "scripts/wait-for-http.sh",
+        )
+
+    def test_rewrite_leading_slash_file_path(self) -> None:
+        req = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "<current_file_path>scripts/wait-for-http.sh</current_file_path>"
+                    ),
+                }
+            ]
+        }
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_read",
+                                    "arguments": json.dumps(
+                                        {
+                                            "file_path": "/scripts/wait-for-http.sh",
+                                            "start_line": 1,
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        out = proxy.promote_chat_completion(payload, req)
+        args = json.loads(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        )
+        self.assertEqual(args["file_path"], "scripts/wait-for-http.sh")
+
     def test_clears_leftover_tool_json_and_dangling_tag(self) -> None:
         content = (
             '{"name": "file_read", "arguments": {"file_path": "scripts/wait-for-http.sh", '

@@ -246,10 +246,30 @@ def _looks_like_path_placeholder(value: str) -> bool:
     return False
 
 
+def _normalize_repo_path(value: str, current_path: str | None) -> str:
+    """OCR expects repo-relative paths; models often emit /scripts/foo.sh."""
+    stripped = value.strip()
+    if _looks_like_path_placeholder(stripped) and current_path:
+        return current_path
+
+    # Drop a single leading slash (not UNC //) and ./ prefixes.
+    if stripped.startswith("/") and not stripped.startswith("//"):
+        stripped = stripped[1:]
+    while stripped.startswith("./"):
+        stripped = stripped[2:]
+
+    if current_path:
+        cur = current_path.lstrip("/").lstrip("./")
+        if stripped == cur or stripped.endswith("/" + cur):
+            return current_path
+
+    return stripped
+
+
 def _rewrite_args_placeholders(
     args: Any, current_path: str | None
 ) -> tuple[Any, bool]:
-    """Replace placeholder paths and drop JSON nulls. Returns (args, changed)."""
+    """Normalize path args, replace placeholders, drop JSON nulls."""
     changed = False
     if isinstance(args, str):
         try:
@@ -268,14 +288,11 @@ def _rewrite_args_placeholders(
         if value is None:
             changed = True
             continue
-        if (
-            current_path
-            and key in PATH_ARG_KEYS
-            and isinstance(value, str)
-            and _looks_like_path_placeholder(value)
-        ):
-            out[key] = current_path
-            changed = True
+        if key in PATH_ARG_KEYS and isinstance(value, str):
+            normalized = _normalize_repo_path(value, current_path)
+            if normalized != value:
+                changed = True
+            out[key] = normalized
             continue
         out[key] = value
     return out, changed
