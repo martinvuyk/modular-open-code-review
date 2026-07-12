@@ -79,8 +79,8 @@ DIFF_PLACEHOLDERS = frozenset(
 )
 
 TASK_DONE_LINE_RE = re.compile(
-    # /task_done, (task_done), [task_done], task_done, Task Done, …
-    r"^[\[\(\{\s/\\]*task[\s_-]*done[\]\)\}\s/\\]*$",
+    # /task_done, (task_done), [task_done], task_done, /task_done {}, …
+    r"^[\[\(\{\s/\\]*task[\s_-]*done[\]\)\}\s/\\]*(?:\s*\{[^}]*\})?\s*$",
     re.IGNORECASE,
 )
 
@@ -364,12 +364,48 @@ def _normalize_repo_path(value: str, current_path: str | None) -> str:
     while stripped.startswith("./"):
         stripped = stripped[2:]
 
+    # Git unified-diff prefixes (a/scripts/foo.sh, b/scripts/foo.sh).
+    if len(stripped) > 2 and stripped[0] in "ab" and stripped[1] == "/":
+        stripped = stripped[2:]
+
     if current_path:
         cur = current_path.lstrip("/").lstrip("./")
+        if cur.startswith("a/") or cur.startswith("b/"):
+            cur = cur[2:]
         if stripped == cur or stripped.endswith("/" + cur):
             return current_path
 
     return stripped
+
+
+def _rewrite_path_array(
+    values: list[Any], current_path: str | None
+) -> tuple[list[Any], bool]:
+    """Normalize path_array entries; collapse a/file + b/file → one path."""
+    changed = False
+    normalized: list[Any] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str):
+            normalized.append(item)
+            continue
+        new_val = _normalize_repo_path(item, current_path)
+        if new_val != item:
+            changed = True
+        if new_val in seen:
+            changed = True
+            continue
+        seen.add(new_val)
+        normalized.append(new_val)
+    if (
+        current_path
+        and len(normalized) >= 1
+        and all(isinstance(x, str) and x == current_path for x in normalized)
+    ):
+        if normalized != [current_path]:
+            changed = True
+        return [current_path], changed
+    return normalized, changed
 
 
 def _rewrite_args_placeholders(
@@ -399,6 +435,12 @@ def _rewrite_args_placeholders(
             if normalized != value:
                 changed = True
             out[key] = normalized
+            continue
+        if key == "path_array" and isinstance(value, list):
+            new_list, list_changed = _rewrite_path_array(value, current_path)
+            if list_changed:
+                changed = True
+            out[key] = new_list
             continue
         out[key] = value
     return out, changed
@@ -667,7 +709,9 @@ def build_tool_policy_text(current_path: str | None) -> str:
         "existing_code must be the exact changed line from the DIFF.\n"
         "- Comment ONLY on real defects in newly added/changed lines. "
         "Do not narrate correct code, or praise the change.\n"
-        f"- Paths are repo-relative (`{path}`), never `/{path}` or `<current_file_path>`.\n"
+        f"- Paths are repo-relative (`{path}`), never `/{path}`, `a/{path}`, "
+        f"`b/{path}`, or `<current_file_path>`. "
+        f'For file_read_diff use path_array: ["{path}"] only.\n'
         "- Finish ONLY with this exact tool call (never prose, never /task_done, "
         "never (task_done)): "
         f"{done_example}\n"

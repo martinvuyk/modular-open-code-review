@@ -156,6 +156,60 @@ class ExtractToolCallsTest(unittest.TestCase):
             "scripts/wait-for-http.sh",
         )
 
+    def test_normalize_git_ab_prefixes(self) -> None:
+        cur = "scripts/wait-for-http.sh"
+        self.assertEqual(proxy._normalize_repo_path("a/scripts/wait-for-http.sh", cur), cur)
+        self.assertEqual(proxy._normalize_repo_path("b/scripts/wait-for-http.sh", cur), cur)
+        self.assertEqual(
+            proxy._normalize_repo_path("a/scripts/wait-for-http.sh", None),
+            "scripts/wait-for-http.sh",
+        )
+
+    def test_rewrite_file_read_diff_ab_path_array(self) -> None:
+        req = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "<current_file_path>scripts/wait-for-http.sh</current_file_path>"
+                    ),
+                }
+            ]
+        }
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "file_read_diff",
+                                    "arguments": json.dumps(
+                                        {
+                                            "path_array": [
+                                                "a/scripts/wait-for-http.sh",
+                                                "b/scripts/wait-for-http.sh",
+                                            ]
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        out = proxy.promote_chat_completion(payload, req)
+        args = json.loads(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        )
+        self.assertEqual(args["path_array"], ["scripts/wait-for-http.sh"])
+
     def test_rewrite_leading_slash_file_path(self) -> None:
         req = {
             "messages": [
@@ -318,6 +372,10 @@ class ExtractToolCallsTest(unittest.TestCase):
             "(task_done)",
             "[task_done]",
             "{task_done}",
+            "/task_done {}",
+            "/task_done{}",
+            "task_done {}",
+            '/task_done {"state":"DONE"}',
         ):
             with self.subTest(text=text):
                 calls = proxy.extract_tool_calls(text)

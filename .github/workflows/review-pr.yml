@@ -409,7 +409,7 @@ jobs:
               session_tools=$(jq -s '[.[] | select(.type=="llm_response") | .tool_calls[]?] | length' "$jsonl" 2>/dev/null || echo 0)
               failed_items=$(jq -s '[.[] | select(.type=="review_item_failed")] | length' "$jsonl" 2>/dev/null || echo 0)
               done_items=$(jq -s '[.[] | select(.type=="review_item_done")] | length' "$jsonl" 2>/dev/null || echo 0)
-              tool_errors=$(jq -s '[.[] | select(.type=="llm_request") | .messages[]? | select(.role=="tool") | select((.content|tostring)|test("Error executing tool"))] | length' "$jsonl" 2>/dev/null || echo 0)
+              tool_errors=$(jq -s '[.[] | select(.type=="llm_request") | .messages[]? | select(.role=="tool") | select((.content|tostring)|test("Error executing tool|^Error:|diff not found|No such file|not found for the requested"))] | length' "$jsonl" 2>/dev/null || echo 0)
               prose_no_tools=$(jq -s '[.[] | select(.type=="llm_response") | select(((.tool_calls // []) | length) == 0) | select(((.content // "") | tostring | length) >= 350)] | length' "$jsonl" 2>/dev/null || echo 0)
               code_comments=$(jq -s '[.[] | select(.type=="llm_response") | .tool_calls[]? | select(.name=="code_comment")] | length' "$jsonl" 2>/dev/null || echo 0)
               session_tools=$(echo "$session_tools" | tr -d '\n\r' | head -c 20)
