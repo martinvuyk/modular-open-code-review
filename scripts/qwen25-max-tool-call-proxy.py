@@ -15,6 +15,8 @@ API response. This proxy:
    is empty but the content looks like a Hermes/JSON tool call, or when the
    model dumps a review essay (extracted into short per-issue ``code_comment``
    entries when concrete defects can be anchored; fluff-only essays are not posted).
+3. Short-circuits OCR's ``REVIEW_FILTER_TASK`` to ``[]`` — Qwen2.5-1.5B otherwise
+   marks real findings as incorrect and OCR posts a false LGTM.
 """
 from __future__ import annotations
 
@@ -124,6 +126,7 @@ STRONG_EMPTY_TOOL_NUDGE = (
 UPSTREAM = "http://127.0.0.1:8000"
 LOG_PREFIX = "[qwen25-max-tool-call-proxy]"
 PROXY_HEALTH_PATH = "/_qwen25_max_tool_call_proxy/health"
+REVIEW_FILTER_MARKER = "fact-checker for code review comments"
 
 HOP_BY_HOP = frozenset(
     {
@@ -768,6 +771,67 @@ def rewrite_chat_request(req_payload: dict[str, Any]) -> tuple[dict[str, Any], b
     return out, True
 
 
+def is_review_filter_request(req_payload: dict[str, Any] | None) -> bool:
+    """True when OCR is running REVIEW_FILTER_TASK (post-hoc comment veto)."""
+    if not isinstance(req_payload, dict):
+        return False
+    messages = req_payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if REVIEW_FILTER_MARKER in _message_text(msg).lower():
+            return True
+    return False
+
+
+def review_filter_keep_all_response(req_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """OCR removes comments whose IDs appear in the filter JSON array.
+
+    Qwen2.5-1.5B routinely returns every id (e.g. ``["c-0","c-1","c-2"]``) even
+    when the findings match the diff, which yields a false LGTM. Always keep.
+    """
+    model = "qwen25-max-tool-call-proxy"
+    if isinstance(req_payload, dict) and isinstance(req_payload.get("model"), str):
+        model = req_payload["model"]
+    content = "```json\n[]\n```"
+    return {
+        "id": f"chatcmpl-filter-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 5,
+            "total_tokens": 5,
+        },
+    }
+
+
+def sanitize_review_filter_response(
+    payload: dict[str, Any], req_payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Force filter responses to keep all comments when this is a filter call."""
+    if not is_review_filter_request(req_payload):
+        return payload
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return review_filter_keep_all_response(req_payload)
+    # Replace whatever the weak model said with an empty reject list.
+    out = review_filter_keep_all_response(req_payload)
+    sys.stderr.write(
+        f"{LOG_PREFIX} REVIEW_FILTER_TASK: forcing [] (weak model must not veto)\n"
+    )
+    return out
+
+
 def _maybe_rewrite_request_body(method: str, path: str, body: bytes) -> bytes:
     if method != "POST" or not path.rstrip("/").endswith("/chat/completions") or not body:
         return body
@@ -938,9 +1002,9 @@ def _maybe_promote_chat_completion(
         return raw
     if req_payload.get("stream") or not isinstance(payload, dict):
         return raw
-    return json.dumps(
-        promote_chat_completion(payload, req_payload), ensure_ascii=False
-    ).encode("utf-8")
+    promoted = promote_chat_completion(payload, req_payload)
+    promoted = sanitize_review_filter_response(promoted, req_payload)
+    return json.dumps(promoted, ensure_ascii=False).encode("utf-8")
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -973,6 +1037,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         body = self._read_body() if method == "POST" else b""
         body = _maybe_rewrite_request_body(method, path, body)
+
+        # Skip MAX for OCR's review filter — Qwen2.5-1.5B vetoes real findings.
+        if method == "POST" and path.rstrip("/").endswith("/chat/completions"):
+            try:
+                req_payload = json.loads(body.decode("utf-8")) if body else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                req_payload = {}
+            if (
+                isinstance(req_payload, dict)
+                and not req_payload.get("stream")
+                and is_review_filter_request(req_payload)
+            ):
+                sys.stderr.write(
+                    f"{LOG_PREFIX} REVIEW_FILTER_TASK: short-circuit keep-all []\n"
+                )
+                self._send_json(200, review_filter_keep_all_response(req_payload))
+                return
+
         try:
             status, resp_headers, raw = _forward_upstream(
                 method, path, body, self._client_headers()

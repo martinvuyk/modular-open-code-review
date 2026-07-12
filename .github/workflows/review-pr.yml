@@ -501,6 +501,12 @@ jobs:
             fail=true
             reason="prose_no_code_comment"
             publish=false
+          elif [ "$code_comments" -gt 0 ] && [ "$comments" = "0" ]; then
+            # Agent filed code_comment but OCR's review_filter_task (or relocation)
+            # dropped every finding → false LGTM.
+            fail=true
+            reason="comments_filtered_to_zero"
+            publish=false
           elif [ -n "$files" ] && [ "$files" != "0" ] && [ "$done_items" = "0" ] \
             && [ -s /tmp/ocr-session.jsonl ]; then
             fail=true
@@ -566,6 +572,9 @@ jobs:
               ;;
             prose_no_code_comment)
               echo "::error::Failing job: model wrote a review essay instead of calling code_comment, then finished with 0 comments (false LGTM). See session artifact; consider a stronger model."
+              ;;
+            comments_filtered_to_zero)
+              echo "::error::Failing job: agent called code_comment but OCR ended with 0 comments (review_filter_task or relocation dropped findings → false LGTM). See session artifact."
               ;;
             incomplete_review)
               echo "::error::Failing job: OCR reviewed files but none completed successfully (no review_item_done). See session artifact."

@@ -465,6 +465,49 @@ class ExtractToolCallsTest(unittest.TestCase):
         self.assertNotIn(proxy.OCR_EMPTY_TOOL_NUDGE, nudge)
         self.assertIn("prose review", nudge)
 
+    def test_review_filter_request_detected(self) -> None:
+        req = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a fact-checker for code review comments.",
+                },
+                {"role": "user", "content": "Return incorrect IDs as JSON."},
+            ]
+        }
+        self.assertTrue(proxy.is_review_filter_request(req))
+        self.assertFalse(
+            proxy.is_review_filter_request(
+                {"messages": [{"role": "system", "content": "You are a reviewer."}]}
+            )
+        )
+
+    def test_sanitize_review_filter_forces_empty_reject_list(self) -> None:
+        req = {
+            "model": "Qwen/Qwen2.5-1.5B-Instruct",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a fact-checker for code review comments.",
+                }
+            ],
+        }
+        bad = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": '```json\n["c-0", "c-1", "c-2"]\n```',
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+        out = proxy.sanitize_review_filter_response(bad, req)
+        content = out["choices"][0]["message"]["content"]
+        self.assertIn("[]", content)
+        self.assertNotIn("c-0", content)
+
 
 if __name__ == "__main__":
     unittest.main()
