@@ -46,17 +46,16 @@ jobs:
 
 ## How it works
 
-```text
-PR commit
-  → restore CBM index cache (base branch SHA)
-  → incremental codebase-memory-mcp index (Phase A, no LLM)
-  → ocr review --preview → token estimate → pick model
-  → start max serve locally (Phase B)
-  → ocr review with MCP + MAX
-  → post inline PR comments
-```
+On each PR:
 
-OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX runs as a local HTTP server on the same job after preflight completes.
+1. Restore / update the codebase-memory index for the base branch (no LLM).
+2. Estimate review size from the diff and pick a model (or use `model_override`).
+3. Run Open Code Review against the LLM:
+   - **Default:** start Modular MAX on the runner, then review.
+   - **With `llm_url`:** call your OpenAI-compatible endpoint instead (no local MAX).
+4. Post inline PR comments (if enabled).
+
+OCR and codebase-memory-mcp share the same job (stdio MCP). With `llm_url`, steps that only matter for local MAX (RAM gating, model cache, Qwen tool-call proxy) are skipped.
 
 ## Workflow inputs
 
@@ -169,39 +168,15 @@ Default chain and limitations (Qwen2.5 1.5B → 0.5B, tool-call proxy, roadmap):
 
 ## Security
 
-This workflow uses `pull_request_target` so secrets and cache are available for fork PRs. OCR only **reads git diffs** and does not execute code from the PR branch. See [GitHub's guidance](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request_target) on `pull_request_target` risks.
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| OOM / runner killed | Workflow auto-downgrades to smaller models; reduce `max_estimated_tokens` or set `model_override` to a smaller model |
-| Slow first run | Run the index warmer and [MAX cache warmer](#max-model-cache) on `push` to `main` |
-| Cache miss on PR | Ensure index workflow ran on the current base branch SHA |
-| Review skipped | PR diff estimate exceeded `max_estimated_tokens` |
-| `max serve` timeout | First CPU cold start can take 20+ minutes (download + compile). Check job log for `tail /tmp/max-serve.log`. Run the MAX cache warmer on `main` so later PRs restore caches. |
-| LLM `context deadline exceeded` | OCR’s default per-request HTTP timeout is **300s**. Local CPU Qwen often needs longer; the workflow sets `OCR_LLM_TIMEOUT=900` and `ocr review --timeout 25` (minutes per file) when using local MAX. (`llm.timeout_sec` is not a valid `ocr config set` key on OCR 1.7.x.) |
+The example consumer workflow uses `pull_request_target` so the job can write PR comments and use cache/secrets on fork PRs. That trigger runs with base-branch privileges — only use trusted reusable workflows, and do not add steps that check out or execute untrusted PR code. This action’s review path **reads git diffs** only; it does not run code from the PR branch. See [GitHub’s guidance](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request_target).
 
 ## MAX model cache
 
-MAX downloads weights from Hugging Face and compiles them for your device. Both are cached via GitHub Actions `actions/cache`:
+Applies only when the review job **runs Modular MAX on the GitHub Actions runner**. If you set `llm_url`, local MAX is skipped and this cache is unused.
 
-| Cache path | Contents |
-|------------|----------|
-| `~/.venv-max` | Python virtualenv with Modular MAX installed (skips `pip install` on a hit; keyed on exact Python patch + MAX version) |
-| `~/.cache/huggingface` | Downloaded model weights (safetensors) |
-| `$RUNNER_TOOL_CACHE/max-gguf` | Downloaded GGUF weight files (`--weight-path`) |
-| `$RUNNER_TOOL_CACHE/modular-max-cache` | MAX compile cache / MEF (`MODULAR_MAX_CACHE_DIR`) |
+Cold start (download weights + compile) is slow on CPU. The workflow stores the MAX install and compiled model artifacts in the **GitHub Actions cache** so later PR jobs can restore them. Caching is on by default (`cache_models: true`); set `cache_models: false` to disable it.
 
-One combined cache holds artifacts for the **whole candidate chain**, keyed on a hash of [`config/models.cpu.json`](config/models.cpu.json) + MAX version (so editing the chain busts it, and PRs share a prefix `restore-key`). The warm workflow (on push to `main`) is what populates it; PR runs restore it read-only. Caches are only saved on success, so a failed compile never poisons the key.
-
-Caching is optional: set `cache_models: false` to disable it, or use `llm_url` to point at an external OpenAI-compatible API — in that case local MAX, its caches, and the RAM pre-flight are all skipped, and `model_override` names the model sent to the external API.
-
-The `setup-modular-max` action serves the first working candidate (compiling on first load, which persists to `MODULAR_MAX_CACHE_DIR`), saves caches on success, and waits up to 30 minutes per candidate for the health endpoint on cold start.
-
-**Recommended:** add the MAX cache warmer (copy [`examples/consumer-warm-max-workflow.yml`](examples/consumer-warm-max-workflow.yml) to `.github/workflows/llm-warm-max.yml`) so **pushes to `main`** pre-compile every model in the chain. PR jobs restore that cache read-only (`cache write denied` on `pull_request_target` is expected). After changing `models.cpu.json` or the cache key (`-v3`), merge to `main` once so the warm job populates the new key before expecting fast PR reviews.
-
-**Alternatives:** use `llm_url` to point at an external API and skip local MAX; or run [`modular/max-full`](https://docs.modular.com/max/container/) in Docker with the same volume mounts (GPU-oriented, but supports `--devices cpu`).
+**Recommended:** add the cache warmer (copy [`examples/consumer-warm-max-workflow.yml`](examples/consumer-warm-max-workflow.yml) to `.github/workflows/llm-warm-max.yml`) so pushes to `main` populate the cache. PR jobs then restore it read-only.
 
 
 ## Repository layout
