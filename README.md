@@ -60,13 +60,22 @@ OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX run
 
 ## Workflow inputs
 
+You can leave the defaults or **choose the model** yourself:
+
+| How | What to set |
+|-----|-------------|
+| Auto (default) | Nothing — local MAX picks the first fitting candidate from [`config/models.cpu.json`](config/models.cpu.json) |
+| Force a local Hugging Face model | `model_override: org/model-id` |
+| Hosted / external API | `llm_url` + `model_override` (model name the API expects) |
+| Change the local candidate list | Edit [`config/models.cpu.json`](config/models.cpu.json), or set `allow_gated_models: true` |
+
 | Input | Default | Description |
 |-------|---------|-------------|
 | `ocr_version` | `1.7.4` | OCR npm version |
 | `cbm_version` | `0.8.1` | codebase-memory-mcp npm version |
 | `modular_version` | `26.4.0` | Modular pip package |
 | `runner` | `ubuntu-24.04` | Runner label |
-| `model_override` | `""` | Force a Hugging Face model ID |
+| `model_override` | `""` | Hugging Face model ID (local MAX) or API model name (with `llm_url`). Empty = use the CPU fallback chain. |
 | `max_estimated_tokens` | `500000` | Skip review when preflight estimate exceeds this |
 | `post_comments` | `true` | Post GitHub review comments |
 | `llm_url` | `""` | External OpenAI-compatible API (skips local MAX, its caching, and RAM gating). Set `model_override` to name the external model. |
@@ -75,6 +84,16 @@ OCR and codebase-memory-mcp **must run on the same runner** (stdio MCP). MAX run
 | `allow_gated_models` | `false` | Include license-gated candidates (e.g. Llama 3.1) in the local fallback chain. Default keeps only ungated Apache-2.0 models. |
 | `debug_review` | `false` | Print OCR session trace in the job log and upload `ocr-session` JSONL artifact (`OCR_CONTENT_LOGGING` to stderr). |
 | `action_ref` | `main` | Ref of this repo for scripts |
+
+### Secrets
+
+The default ungated Qwen models do **not** need secrets. Add a repository secret when you override to a gated Hub model, raise rate limits, or otherwise need authenticated Hugging Face downloads.
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `HF_TOKEN` | Optional | [Hugging Face access token](https://huggingface.co/settings/tokens). Forwarded to `max serve` via `secrets: inherit` in the consumer workflow. |
+
+Keep `secrets: inherit` on the reusable workflow call (as in the quick-start example) so `HF_TOKEN` reaches the job when present.
 
 ### `max_estimated_tokens`
 
@@ -88,7 +107,7 @@ Rough scale (heuristic, not exact):
 | ~5k changed lines, ~20 files | ~150k–250k |
 | ~50+ changed files (even modest diffs) | ~400k+ (per-file overhead dominates) |
 
-Example with overrides:
+Example — pin a model and lower the preflight cap:
 
 ```yaml
 jobs:
@@ -101,6 +120,21 @@ jobs:
 ```
 
 `model_override` bypasses the fallback chain and loads that single model as `float32` safetensors (no GGUF/`--weight-path`), so only use it for models that fit your runner as `float32`, or on a larger runner. For a stronger quantized model, prefer editing the chain in [`config/models.cpu.json`](config/models.cpu.json) or setting `allow_gated_models: true`.
+
+## Default Qwen2.5 CPU models
+
+On GitHub-hosted **CPU** runners with Modular MAX **26.4**, the practical local defaults are small **Qwen2.5 Instruct** checkpoints in **safetensors `float32`**:
+
+1. `Qwen/Qwen2.5-1.5B-Instruct`
+2. `Qwen/Qwen2.5-0.5B-Instruct` (fallback if 1.5B does not fit)
+
+These are ungated (Apache 2.0) and fit ~16 GB runners. They are **not** strong code-review agents: tool use is unreliable, multi-step OCR loops often stall, and review quality is limited compared with larger or hosted models.
+
+**Why these sizes.** MAX 26.4 on CPU rejects GGUF/`q4_k` at startup (`quantization_encoding of 'q4_k' not supported`). A 7B `float32` model needs ~28 GB and OOMs on typical hosted runners. Until Modular ships better CPU encodings (or larger runners / `llm_url`), the chain stays on 0.5B–1.5B.
+
+**Tool-calling proxy.** OCR expects OpenAI-style `tool_calls`. Qwen2.5 on local MAX usually emits Hermes-style `<tool_call>…</tool_call>` (or plain text) instead. When the served model ID matches Qwen 2.5, [`scripts/qwen25-max-tool-call-proxy.py`](scripts/qwen25-max-tool-call-proxy.py) starts automatically (OCR → `:8001` proxy → MAX `:8000`). It injects a short tool-use policy, promotes near-miss tool text into structured calls, rewrites bad paths, and short-circuits OCR’s weak review filter so tiny models do not veto real findings into a false LGTM. External `llm_url` endpoints skip the proxy. Outcome gates still fail the job on incomplete reviews (e.g. `review_item_failed`, tool errors with no comments) instead of posting a false LGTM.
+
+**Roadmap.** When stronger models become usable on CPU under MAX (quantization, larger hosted runners, or better open weights in the chain), we will promote them in [`config/models.cpu.json`](config/models.cpu.json) and shrink or drop Qwen2.5-specific proxy workarounds. For production-quality reviews today, prefer `llm_url` with a tool-capable hosted model.
 
 ## Pinned versions
 
@@ -125,26 +159,13 @@ The local CPU path uses an **ordered fallback chain** (see `candidates` in [`con
 quantization_encoding of 'q4_k' not supported by MAX engine
 ```
 
-So the default chain is **`Qwen2.5-1.5B-Instruct` → `Qwen2.5-0.5B-Instruct`** (both `float32`). A 7B model at `float32` needs ~28 GB and OOMs on 16 GB runners. For strong reviews use `llm_url` (hosted model) or a larger runner.
+Default chain and limitations (Qwen2.5 1.5B → 0.5B, tool-call proxy, roadmap): see [Default Qwen2.5 CPU models](#default-qwen25-cpu-models).
 
 **Latency.** CPU `float32` 1.5B reviews take minutes per file. The warm workflow on `main` pre-compiles models so PR jobs restore cache instead of cold-starting.
 
 **RAM pre-flight.** Peak RAM is estimated from parameter count × encoding bytes + safety factor (see `ram_estimate` in config). Candidates that exceed `MemAvailable` are dropped.
 
 **Debugging OCR.** Set `debug_review: true` to enable telemetry content logging, print a session trace in the job log, and upload the JSONL audit as a workflow artifact (`ocr-session-<id>`). Locally: `ocr session list` / `ocr session show <id>`. On CI the audit lives only on the ephemeral runner unless uploaded — previous runs without `debug_review` left no retrievable artifact.
-
-**Tool-calling.** Qwen2.5 on local MAX returns Hermes-style `<tool_call>…</tool_call>` in response text instead of OpenAI `tool_calls`. When the served model ID matches Qwen 2.5, [`scripts/qwen25-max-tool-call-proxy.py`](scripts/qwen25-max-tool-call-proxy.py) starts automatically on port 8001 (MAX API stays on 8000; Prometheus metrics move to 9090 so they do not collide). The proxy (1) injects a short tool-use policy + multi-finding `code_comment` few-shot (no essays/Conclusions/full-file rewrites) and rewrites OCR’s weak empty-tool nudge, (2) promotes Hermes/JSON tool text and extracts concrete defects from review essays into short per-line `code_comment` entries (fluff-only essays are not posted), (3) short-circuits OCR’s `REVIEW_FILTER_TASK` to keep all comments (Qwen2.5-1.5B otherwise vetoes real findings → false LGTM), (4) rewrites literal `<current_file_path>` / leading-`/` paths. External `llm_url` endpoints skip the proxy. The job fails (and does not post a false LGTM) when the session has `review_item_failed`, no successful `review_item_done`, tool errors with zero comments, a prose review with zero `code_comment` calls, or `code_comment` tool use with zero final comments (filter wipe).
-
-## Secrets
-
-The default Qwen models do not require secrets. Add repository secrets when you override the model or use gated Hugging Face weights.
-
-| Secret | Required | Description |
-|--------|----------|-------------|
-| `HF_TOKEN` | Optional | [Hugging Face access token](https://huggingface.co/settings/tokens). Used when downloading models from the Hub (gated models, higher rate limits). Passed via `secrets: inherit` in the consumer workflow. |
-
-Example — set `HF_TOKEN` in your repo settings, then keep `secrets: inherit` in the workflow (already in the quick-start example). The reusable workflow forwards it to `max serve` when starting the local LLM.
-
 
 ## Security
 
@@ -181,23 +202,6 @@ The `setup-modular-max` action serves the first working candidate (compiling on 
 **Recommended:** add the MAX cache warmer (copy [`examples/consumer-warm-max-workflow.yml`](examples/consumer-warm-max-workflow.yml) to `.github/workflows/llm-warm-max.yml`) so **pushes to `main`** pre-compile every model in the chain. PR jobs restore that cache read-only (`cache write denied` on `pull_request_target` is expected). After changing `models.cpu.json` or the cache key (`-v3`), merge to `main` once so the warm job populates the new key before expecting fast PR reviews.
 
 **Alternatives:** use `llm_url` to point at an external API and skip local MAX; or run [`modular/max-full`](https://docs.modular.com/max/container/) in Docker with the same volume mounts (GPU-oriented, but supports `--devices cpu`).
-
-### Why we compile instead of downloading a prebuilt model
-
-There is no downloadable "prebuilt binary" for a chosen model. MAX's compiled artifact is a **MEF** (Modular Executable Format) file stored in `MODULAR_MAX_CACHE_DIR`. Per [Modular](https://forum.modular.com/t/how-to-import-and-run-an-exported-max-model-from-mef/580), the serialized MEF cache is **device- and MAX-version-specific and not portable**, so Modular does not publish per-model compiled artifacts to download.
-
-Our "download once, fall back to compile" strategy is therefore implemented with the GitHub Actions cache itself: the warm workflow serves each chain model once (which downloads + compiles it), we persist `MODULAR_MAX_CACHE_DIR`, and later runs restore it (cache hit = fast path, cache miss = recompile). This is the supported equivalent of shipping a prebuilt binary within a single runner OS + MAX version.
-
-A manual MEF export/import path also exists but Modular considers it "largely obsolete" now that automatic graph caching is reliable, so we do **not** use it. Kept here for reference only:
-
-```python
-# DISABLED / reference only — MEF is not portable across devices or MAX versions.
-# from max.engine import InferenceSession
-# session = InferenceSession()
-# compiled = session.compile(model_path)   # produce CompiledModel
-# compiled.export_mef("qwen-cpu.mef")       # serialize compiled artifact
-# session.load("qwen-cpu.mef")              # later: load without recompiling
-```
 
 
 ## Repository layout
