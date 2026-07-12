@@ -32,6 +32,8 @@ jobs:
 
 ### 2. Index warmer (recommended)
 
+Speeds up PR reviews by pre-building the **codebase-memory** index on `main`. Useful whether you run local MAX or set `llm_url` — OCR still uses that index either way.
+
 Copy [`examples/consumer-index-workflow.yml`](examples/consumer-index-workflow.yml) to `.github/workflows/llm-index.yml`:
 
 ```yaml
@@ -43,6 +45,10 @@ jobs:
   index:
     uses: martinvuyk/modular-open-code-review/.github/workflows/index-base-branch.yml@main
 ```
+
+### 3. MAX cache warmer (local MAX only)
+
+Only needed when the review job runs Modular MAX on the runner. Skip this if you use `llm_url`. See [MAX model cache](#max-model-cache).
 
 ## How it works
 
